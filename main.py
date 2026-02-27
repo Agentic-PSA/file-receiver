@@ -442,6 +442,51 @@ async def delete_single_file(
     return {"deleted": True, "filename": filename, "doc_id": doc_id}
 
 
+# ── List KB directories for tenant ────────────────────────────
+
+
+@app.get("/files/{tenant_slug}")
+async def list_tenant_kbs(
+    tenant_slug: str,
+    x_api_key: str = Header(...),
+    x_tenant: Optional[str] = Header(None),
+):
+    """List all knowledge base directories (and local upload folders) for a tenant."""
+    verify_api_key(x_api_key)
+    verify_tenant(tenant_slug, x_tenant)
+
+    tenant_path = Path(STORAGE_ROOT) / tenant_slug
+    if not tenant_path.exists():
+        return {"tenant_slug": tenant_slug, "knowledge_bases": [], "total": 0}
+
+    kbs = []
+    for kb_dir in sorted(tenant_path.iterdir()):
+        if not kb_dir.is_dir():
+            continue
+        doc_count = 0
+        file_count = 0
+        total_bytes = 0
+        for doc_dir in kb_dir.iterdir():
+            if doc_dir.is_dir():
+                doc_count += 1
+                for f in doc_dir.iterdir():
+                    if f.is_file() and f.name != "metadata.json":
+                        file_count += 1
+                        total_bytes += f.stat().st_size
+        kbs.append({
+            "kb_id": kb_dir.name,
+            "doc_count": doc_count,
+            "file_count": file_count,
+            "total_size_bytes": total_bytes,
+        })
+
+    return {
+        "tenant_slug": tenant_slug,
+        "knowledge_bases": kbs,
+        "total": len(kbs),
+    }
+
+
 # ── Tenant stats ──────────────────────────────────────────────
 
 
