@@ -223,11 +223,16 @@ async def ocr_call_gemini(
 
     if extract_images:
         system_prompt = (
-            "Jestes ekspertem od ekstrakcji tresci z dokumentow. Wykonaj DWA zadania:\n"
-            "1. EKSTRAKCJA TEKSTU: Przepisz dokladnie CALY tekst w Markdown.\n"
-            "2. DETEKCJA OBRAZOW: Zidentyfikuj elementy graficzne. "
-            f"Dla kazdego podaj typ i opis (max {image_desc_tokens} tokenow). Pusta lista jesli brak.\n\n"
-            'Odpowiedz WYLACZNIE JSON:\n{"text": "...", "images": [{"type": "...", "description": "..."}]}'
+            "Jestes ekspertem od analizy dokumentow. Wykonaj DWA zadania na tej stronie dokumentu:\n\n"
+            "ZADANIE 1 — EKSTRAKCJA TEKSTU:\nPrzepisz dokladnie CALY tekst widoczny na stronie. "
+            "Zachowaj oryginalna strukture: naglowki, akapity, punkty, tabele w formacie Markdown.\n\n"
+            "ZADANIE 2 — DETEKCJA OBRAZOW:\nZidentyfikuj WSZYSTKIE elementy graficzne na stronie: "
+            "zdjecia, diagramy, wykresy, schematy, rysunki techniczne, logo, mapy, ilustracje.\n"
+            f"Dla KAZDEGO obrazu podaj typ, pozycje i szczegolowy opis (max {image_desc_tokens} tokenow).\n"
+            "Jesli na stronie NIE MA zadnych obrazow/grafik (tylko tekst/tabele), zwroc pusty array.\n\n"
+            'Odpowiedz WYLACZNIE w formacie JSON:\n'
+            '{"text": "caly wyekstrahowany tekst w Markdown...", '
+            '"images": [{"type": "diagram", "position": "gora", "description": "..."}]}'
         )
     else:
         system_prompt = (
@@ -412,7 +417,8 @@ async def ocr_worker_process(job: OcrJobRequest):
                             extract_images=extract_images,
                             image_desc_tokens=image_desc_tokens,
                         )
-                        return {"page_idx": page_idx, "result": result}
+                        # Attach page image base64 so pipeline can store it in image chunks
+                        return {"page_idx": page_idx, "result": result, "page_image_b64": img_b64}
                     except httpx.HTTPStatusError as e:
                         if e.response.status_code == 429:
                             wait = 10 * (attempt + 1)
@@ -425,8 +431,8 @@ async def ocr_worker_process(job: OcrJobRequest):
                             await asyncio.sleep(5)
                         else:
                             print(f"[ocr-worker] Page {page_idx + 1} failed after 3 attempts: {e}")
-                            return {"page_idx": page_idx, "result": {"text": f"[OCR ERROR: {e}]", "images": []}}
-                return {"page_idx": page_idx, "result": {"text": "[OCR ERROR]", "images": []}}
+                            return {"page_idx": page_idx, "result": {"text": f"[OCR ERROR: {e}]", "images": []}, "page_image_b64": None}
+                return {"page_idx": page_idx, "result": {"text": "[OCR ERROR]", "images": []}, "page_image_b64": None}
 
             tasks = [process_page(idx) for idx in batch_indices]
             results = await asyncio.gather(*tasks)
@@ -434,6 +440,7 @@ async def ocr_worker_process(job: OcrJobRequest):
             for r in results:
                 idx = r["page_idx"]
                 text = r["result"].get("text", "")
+                page_img_b64 = r.get("page_image_b64")
                 all_page_texts[idx] = text
                 pages_done += 1
 
@@ -444,6 +451,7 @@ async def ocr_worker_process(job: OcrJobRequest):
                         "description": f"[Obraz: {img_info.get('type', 'unknown')}, strona {idx + 1}] {img_info.get('description', '')}",
                         "section_context": text[:1000] if text else "",
                         "page": idx + 1,
+                        "page_image_base64": page_img_b64,
                     })
 
             ocr_jobs[job_id]["pages_done"] = pages_done
