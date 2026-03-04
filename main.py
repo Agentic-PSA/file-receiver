@@ -13,6 +13,7 @@ Tenant isolation is enforced: X-Tenant header must match the path tenant_slug.
 """
 
 import base64
+import functools
 import io
 import json
 import os
@@ -20,7 +21,6 @@ import uuid
 import shutil
 import asyncio
 import traceback
-import time
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, Any
@@ -45,16 +45,18 @@ QWEN_API_URL = "https://qwen.agentic.pl/v1/chat/completions"
 QWEN_MODEL = "Qwen/Qwen2.5-VL-7B-Instruct"
 
 # OCR Worker config
-OCR_BATCH_SIZE = int(os.getenv("OCR_BATCH_SIZE", "10"))  # pages per Gemini call
-OCR_PAGE_CONCURRENCY = int(os.getenv("OCR_PAGE_CONCURRENCY", "3"))  # parallel batches
-OCR_HEARTBEAT_INTERVAL = int(os.getenv("OCR_HEARTBEAT_INTERVAL", "10"))  # pages between heartbeats
+# Number of pages converted from disk to RAM at once — keeps peak RAM ~130 MB
+# regardless of total document length (e.g. 2000 pages @ 150 DPI ≈ 13 GB without chunking)
+PDF_CHUNK_SIZE = int(os.getenv("PDF_CHUNK_SIZE", "20"))
+OCR_PAGE_CONCURRENCY = int(os.getenv("OCR_PAGE_CONCURRENCY", "3"))    # parallel OCR API calls per batch
+OCR_HEARTBEAT_INTERVAL = int(os.getenv("OCR_HEARTBEAT_INTERVAL", "10"))  # pages between DB heartbeats
 
 # Active OCR jobs tracking (in-memory)
 ocr_jobs: Dict[str, Dict[str, Any]] = {}
 
 app = FastAPI(
     title="BlueBox File Receiver",
-    version="3.0.0",
+    version="3.2.0",
     description="Tenant-isolated file storage + PDF-to-images + Background OCR Worker",
 )
 
@@ -268,7 +270,7 @@ async def ocr_call_gemini(
         result = resp.json()
         content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
 
-        # Try parse JSON
+        # Attempt to parse JSON response; fall back to raw text
         try:
             cleaned = content.strip()
             if cleaned.startswith("```json"):
@@ -293,7 +295,7 @@ async def update_heartbeat(
 ) -> str:
     """Update heartbeat in DB and return current ingestion status."""
     async with httpx.AsyncClient(timeout=30) as client:
-        # Get tenant slug
+        # Resolve tenant slug
         resp = await client.get(
             f"{supabase_url}/rest/v1/tenants?id=eq.{tenant_id}&select=slug",
             headers={
@@ -307,7 +309,7 @@ async def update_heartbeat(
         slug = tenants[0]["slug"]
         schema = f"tenant_{slug}"
 
-        # Check status & update heartbeat
+        # Touch updated_at and return current status in one query
         resp = await client.post(
             f"{supabase_url}/rest/v1/rpc/execute_tenant_query",
             headers={
@@ -316,7 +318,12 @@ async def update_heartbeat(
                 "Content-Type": "application/json",
             },
             json={
-                "p_query": f"UPDATE {schema}.ingestions SET updated_at = now() WHERE id = '{ingestion_id}' RETURNING status"
+                "p_query": (
+                    f"UPDATE {schema}.ingestions "
+                    f"SET updated_at = now() "
+                    f"WHERE id = '{ingestion_id}' "
+                    f"RETURNING status"
+                )
             },
         )
         rows = resp.json()
@@ -327,13 +334,28 @@ async def update_heartbeat(
 
 async def ocr_worker_process(job: OcrJobRequest):
     """
-    Background task: OCR a large PDF page by page.
+    Background task: OCR a large PDF page by page without loading the whole
+    document into RAM at once.
 
-    1. Download PDF
-    2. Convert to page images (local pdf2image)
-    3. OCR each page via Gemini/Qwen
-    4. Update DB progress
-    5. Callback pipeline with full text
+    Memory strategy
+    ───────────────
+    1. Stream-download (or decode) the PDF directly to a temp file on disk —
+       never hold the full byte string in memory alongside the image data.
+    2. Use pdfinfo_from_path to learn the page count cheaply (no rasterisation).
+    3. Rasterise only PDF_CHUNK_SIZE pages at a time with convert_from_path,
+       then discard those PIL Images before converting the next chunk.
+
+    Peak RAM per chunk:  PDF_CHUNK_SIZE × DPI² × channels ≈ 20 × 6.5 MB ≈ 130 MB
+    vs. naive approach:  2 000 pages × 6.5 MB                            ≈ 13 GB
+
+    4. Both pdfinfo_from_path and convert_from_path run in a thread-pool executor
+       via asyncio.get_running_loop().run_in_executor() so that the synchronous
+       poppler subprocess calls never block the event loop. Multiple concurrent
+       OCR jobs can therefore make progress during each other's rasterisation steps.
+    5. functools.partial is used instead of lambda so that PyCharm's type checker
+       does not raise "Parameter 'args' unfilled" on run_in_executor calls.
+    6. Temp file is always removed in the `finally` block, even on cancellation
+       or unhandled exceptions, preventing /tmp from filling up.
     """
     job_id = f"{job.ingestion_id}_{job.file_index}"
     ocr_jobs[job_id] = {
@@ -344,132 +366,215 @@ async def ocr_worker_process(job: OcrJobRequest):
         "error": None,
     }
 
-    try:
-        from pdf2image import convert_from_bytes
+    # Temp file path — declared before try so finally can always clean up
+    tmp_path: Optional[str] = None
 
-        # Step 1: Get PDF bytes
+    try:
+        from pdf2image import convert_from_path, pdfinfo_from_path
+
         print(f"[ocr-worker] Starting job {job_id}: {job.file_name}")
 
+        # Obtain the running event loop once; reused for all executor calls below.
+        # get_running_loop() is preferred over get_event_loop() in Python 3.10+:
+        # it raises RuntimeError immediately if called outside a coroutine instead
+        # of silently creating a new loop that would never be awaited.
+        loop = asyncio.get_running_loop()
+
+        # ── Step 1: Write PDF to disk ──────────────────────────────────────────
+        # Use a unique temp path so concurrent jobs never collide.
+        tmp_path = f"/tmp/ocr_{job_id}_{uuid.uuid4().hex}.pdf"
+
         if job.file_download_url:
-            print(f"[ocr-worker] Downloading from URL...")
+            # Stream directly to disk — avoids holding the full body in RAM
+            print(f"[ocr-worker] Streaming download → {tmp_path}")
             async with httpx.AsyncClient(timeout=300) as client:
-                resp = await client.get(job.file_download_url)
-                resp.raise_for_status()
-                pdf_bytes = resp.content
+                async with client.stream("GET", job.file_download_url) as resp:
+                    resp.raise_for_status()
+                    with open(tmp_path, "wb") as fh:
+                        async for chunk in resp.aiter_bytes(chunk_size=1024 * 1024):
+                            fh.write(chunk)
+
         elif job.file_base64:
+            # Decode base64 payload and immediately flush to disk
+            print(f"[ocr-worker] Decoding base64 → {tmp_path}")
             pdf_bytes = base64.b64decode(job.file_base64)
+            with open(tmp_path, "wb") as fh:
+                fh.write(pdf_bytes)
+            del pdf_bytes  # release RAM before rasterisation begins
+
         else:
-            raise ValueError("No file source provided")
+            raise ValueError("No file source provided (file_download_url or file_base64 required)")
 
-        print(f"[ocr-worker] PDF size: {len(pdf_bytes)} bytes")
+        file_size_mb = os.path.getsize(tmp_path) / 1024 / 1024
+        print(f"[ocr-worker] PDF on disk: {file_size_mb:.1f} MB → {tmp_path}")
 
-        # Step 2: Convert ALL pages to images
-        print(f"[ocr-worker] Converting PDF to images (DPI={PDF_DPI})...")
-        images = convert_from_bytes(pdf_bytes, dpi=PDF_DPI, fmt="jpeg")
-        total_pages = len(images)
+        # ── Step 2: Determine page count without loading any images ───────────
+        # pdfinfo_from_path calls a poppler subprocess — run in executor so it
+        # does not block the event loop while other jobs are awaiting I/O.
+        info = await loop.run_in_executor(
+            None,
+            functools.partial(pdfinfo_from_path, tmp_path),
+        )
+        total_pages = info["Pages"]
         ocr_jobs[job_id]["total_pages"] = total_pages
-        print(f"[ocr-worker] Got {total_pages} page images")
+        print(f"[ocr-worker] Total pages: {total_pages}")
 
-        # Free PDF bytes from memory
-        del pdf_bytes
-
-        # Step 3: OCR each page in batches
+        # ── Step 3: Process in chunks ──────────────────────────────────────────
         extract_images = job.settings.get("extractImages", False)
         image_desc_tokens = job.settings.get("imageDescTokens", 200)
-        all_page_texts = [""] * total_pages
-        all_images = []
+        all_page_texts: list[str] = [""] * total_pages
+        all_images: list[Dict[str, Any]] = []
         pages_done = 0
 
-        # Process pages in small concurrent batches
-        for batch_start in range(0, total_pages, OCR_PAGE_CONCURRENCY):
-            batch_end = min(batch_start + OCR_PAGE_CONCURRENCY, total_pages)
-            batch_indices = list(range(batch_start, batch_end))
+        for chunk_start_0 in range(0, total_pages, PDF_CHUNK_SIZE):
+            chunk_end_0 = min(chunk_start_0 + PDF_CHUNK_SIZE, total_pages)
 
-            # Check cancellation
-            if pages_done > 0 and pages_done % OCR_HEARTBEAT_INTERVAL == 0:
-                try:
-                    status = await update_heartbeat(
-                        job.supabase_url, job.supabase_service_role_key,
-                        job.tenant_id, job.ingestion_id,
-                        pages_done, total_pages,
-                    )
-                    if status in ("cancelled", "paused"):
-                        print(f"[ocr-worker] Job {job_id} {status} by user, stopping.")
-                        ocr_jobs[job_id]["status"] = status
-                        return
-                except Exception as e:
-                    print(f"[ocr-worker] Heartbeat error: {e}")
+            # pdf2image uses 1-based page numbering
+            first_page = chunk_start_0 + 1
+            last_page = chunk_end_0
 
-            # Convert batch images to base64 and OCR
-            async def process_page(page_idx: int) -> Dict:
-                img = images[page_idx]
-                buf = io.BytesIO()
-                img.save(buf, format="JPEG", quality=85)
-                img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-                buf.close()
+            print(
+                f"[ocr-worker] Rasterising pages {first_page}–{last_page} "
+                f"of {total_pages} (DPI={PDF_DPI})..."
+            )
 
-                for attempt in range(3):
+            # convert_from_path calls pdftoppm (synchronous subprocess).
+            # Running it in the thread-pool executor yields control back to the
+            # event loop so that other coroutines (e.g. OCR API calls from a
+            # concurrent job) can continue while poppler renders this chunk.
+            # functools.partial avoids the PyCharm "Parameter 'args' unfilled"
+            # false-positive that appears when a lambda is passed to run_in_executor.
+            chunk_images = await loop.run_in_executor(
+                None,
+                functools.partial(
+                    convert_from_path,
+                    tmp_path,
+                    dpi=PDF_DPI,
+                    fmt="jpeg",
+                    first_page=first_page,
+                    last_page=last_page,
+                ),
+            )
+
+            # ── OCR this chunk in small concurrent batches ─────────────────
+            for batch_start in range(0, len(chunk_images), OCR_PAGE_CONCURRENCY):
+                batch_end = min(batch_start + OCR_PAGE_CONCURRENCY, len(chunk_images))
+
+                # Periodic heartbeat to DB — also checks for cancellation
+                if pages_done > 0 and pages_done % OCR_HEARTBEAT_INTERVAL == 0:
                     try:
-                        result = await ocr_call_gemini(
-                            img_b64, job.lovable_api_key,
-                            anonymize=job.anonymize,
-                            qwen_api_key=job.qwen_api_key,
-                            extract_images=extract_images,
-                            image_desc_tokens=image_desc_tokens,
+                        status = await update_heartbeat(
+                            job.supabase_url,
+                            job.supabase_service_role_key,
+                            job.tenant_id,
+                            job.ingestion_id,
+                            pages_done,
+                            total_pages,
                         )
-                        # Attach page image base64 so pipeline can store it in image chunks
-                        return {"page_idx": page_idx, "result": result, "page_image_b64": img_b64}
-                    except httpx.HTTPStatusError as e:
-                        if e.response.status_code == 429:
-                            wait = 10 * (attempt + 1)
-                            print(f"[ocr-worker] Rate limited on page {page_idx + 1}, waiting {wait}s...")
-                            await asyncio.sleep(wait)
-                        else:
-                            raise
-                    except Exception as e:
-                        if attempt < 2:
-                            await asyncio.sleep(5)
-                        else:
-                            print(f"[ocr-worker] Page {page_idx + 1} failed after 3 attempts: {e}")
-                            return {"page_idx": page_idx, "result": {"text": f"[OCR ERROR: {e}]", "images": []}, "page_image_b64": None}
-                return {"page_idx": page_idx, "result": {"text": "[OCR ERROR]", "images": []}, "page_image_b64": None}
+                        if status in ("cancelled", "paused"):
+                            print(f"[ocr-worker] Job {job_id} {status} by user, stopping.")
+                            ocr_jobs[job_id]["status"] = status
+                            return
+                    except Exception as hb_err:
+                        print(f"[ocr-worker] Heartbeat error: {hb_err}")
 
-            tasks = [process_page(idx) for idx in batch_indices]
-            results = await asyncio.gather(*tasks)
+                async def process_page(local_idx: int) -> Dict:
+                    """Encode one PIL Image to JPEG/base64 and call the OCR API."""
+                    global_page_idx = chunk_start_0 + local_idx
+                    img = chunk_images[local_idx]
 
-            for r in results:
-                idx = r["page_idx"]
-                text = r["result"].get("text", "")
-                page_img_b64 = r.get("page_image_b64")
-                all_page_texts[idx] = text
-                pages_done += 1
+                    buf = io.BytesIO()
+                    img.save(buf, format="JPEG", quality=85)
+                    img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+                    buf.close()
 
-                # Collect images
-                detected_images = r["result"].get("images", [])
-                for img_info in detected_images:
-                    all_images.append({
-                        "description": f"[Obraz: {img_info.get('type', 'unknown')}, strona {idx + 1}] {img_info.get('description', '')}",
-                        "section_context": text[:1000] if text else "",
-                        "page": idx + 1,
-                        "page_image_base64": page_img_b64,
-                    })
+                    for attempt in range(3):
+                        try:
+                            result = await ocr_call_gemini(
+                                img_b64,
+                                job.lovable_api_key,
+                                anonymize=job.anonymize,
+                                qwen_api_key=job.qwen_api_key,
+                                extract_images=extract_images,
+                                image_desc_tokens=image_desc_tokens,
+                            )
+                            return {
+                                "page_idx": global_page_idx,
+                                "result": result,
+                                "page_image_b64": img_b64,
+                            }
+                        except httpx.HTTPStatusError as e:
+                            if e.response.status_code == 429:
+                                wait = 10 * (attempt + 1)
+                                print(
+                                    f"[ocr-worker] Rate limited on page "
+                                    f"{global_page_idx + 1}, retrying in {wait}s..."
+                                )
+                                await asyncio.sleep(wait)
+                            else:
+                                raise
+                        except Exception as exc:
+                            if attempt < 2:
+                                await asyncio.sleep(5)
+                            else:
+                                print(
+                                    f"[ocr-worker] Page {global_page_idx + 1} "
+                                    f"failed after 3 attempts: {exc}"
+                                )
+                                return {
+                                    "page_idx": global_page_idx,
+                                    "result": {"text": f"[OCR ERROR: {exc}]", "images": []},
+                                    "page_image_b64": None,
+                                }
 
-            ocr_jobs[job_id]["pages_done"] = pages_done
-            print(f"[ocr-worker] Progress: {pages_done}/{total_pages} pages")
+                    # Unreachable, but satisfies type checker
+                    return {
+                        "page_idx": global_page_idx,
+                        "result": {"text": "[OCR ERROR]", "images": []},
+                        "page_image_b64": None,
+                    }
 
-            # Small delay between batches to respect rate limits
-            if batch_end < total_pages:
-                await asyncio.sleep(0.5)
+                tasks = [process_page(idx) for idx in range(batch_start, batch_end)]
+                results = await asyncio.gather(*tasks)
 
-        # Free images from memory
-        del images
+                for r in results:
+                    idx = r["page_idx"]
+                    text = r["result"].get("text", "")
+                    page_img_b64 = r.get("page_image_b64")
+                    all_page_texts[idx] = text
+                    pages_done += 1
 
-        # Step 4: Combine text
+                    for img_info in r["result"].get("images", []):
+                        all_images.append({
+                            "description": (
+                                f"[Image: {img_info.get('type', 'unknown')}, "
+                                f"page {idx + 1}] {img_info.get('description', '')}"
+                            ),
+                            "section_context": text[:1000] if text else "",
+                            "page": idx + 1,
+                            "page_image_base64": page_img_b64,
+                        })
+
+                ocr_jobs[job_id]["pages_done"] = pages_done
+                print(f"[ocr-worker] Progress: {pages_done}/{total_pages} pages")
+
+                # Small back-off between OCR batches to respect API rate limits
+                if batch_end < len(chunk_images):
+                    await asyncio.sleep(0.5)
+
+            # Free this chunk's PIL Images before rasterising the next chunk —
+            # this is the critical step that keeps RAM bounded.
+            del chunk_images
+
+        # ── Step 4: Combine extracted text ────────────────────────────────────
         full_text = "\n\n---\n\n".join(t for t in all_page_texts if t)
-        print(f"[ocr-worker] OCR complete: {len(full_text)} chars, {len(all_images)} images from {total_pages} pages")
+        print(
+            f"[ocr-worker] OCR complete: {len(full_text)} chars, "
+            f"{len(all_images)} images from {total_pages} pages"
+        )
 
-        # Step 5: Callback pipeline with extracted text
-        print(f"[ocr-worker] Calling back pipeline...")
+        # ── Step 5: Callback pipeline with full extracted text ────────────────
+        print(f"[ocr-worker] Calling back pipeline at {job.callback_url}")
         callback_body = {
             "file_name": job.file_name,
             "file_id": job.file_id,
@@ -483,7 +588,7 @@ async def ocr_worker_process(job: OcrJobRequest):
             "file_source_type": job.file_source_type,
             "file_user_id": job.file_user_id,
             "auth_token": job.auth_token,
-            # Pass image data so pipeline can create image chunks
+            # Image data for pipeline to create image chunks
             "_ocr_images": all_images,
             "_ocr_page_count": total_pages,
         }
@@ -513,7 +618,7 @@ async def ocr_worker_process(job: OcrJobRequest):
         ocr_jobs[job_id]["status"] = "failed"
         ocr_jobs[job_id]["error"] = error_msg
 
-        # Mark file as error in DB
+        # Best-effort: mark the file as errored in the DB and trigger next file
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.get(
@@ -528,7 +633,6 @@ async def ocr_worker_process(job: OcrJobRequest):
                     slug = tenants[0]["slug"]
                     schema = f"tenant_{slug}"
 
-                    # Get pending_files, mark this file as error
                     resp2 = await client.post(
                         f"{job.supabase_url}/rest/v1/rpc/execute_tenant_query",
                         headers={
@@ -537,7 +641,10 @@ async def ocr_worker_process(job: OcrJobRequest):
                             "Content-Type": "application/json",
                         },
                         json={
-                            "p_query": f"SELECT pending_files FROM {schema}.ingestions WHERE id = '{job.ingestion_id}'"
+                            "p_query": (
+                                f"SELECT pending_files FROM {schema}.ingestions "
+                                f"WHERE id = '{job.ingestion_id}'"
+                            )
                         },
                     )
                     rows = resp2.json()
@@ -558,13 +665,20 @@ async def ocr_worker_process(job: OcrJobRequest):
                                     "Content-Type": "application/json",
                                 },
                                 json={
-                                    "p_query": f"UPDATE {schema}.ingestions SET pending_files = '{pf_json}'::jsonb, processed_count = {pc}, error_count = {ec}, updated_at = now() WHERE id = '{job.ingestion_id}' RETURNING id"
+                                    "p_query": (
+                                        f"UPDATE {schema}.ingestions "
+                                        f"SET pending_files = '{pf_json}'::jsonb, "
+                                        f"processed_count = {pc}, "
+                                        f"error_count = {ec}, "
+                                        f"updated_at = now() "
+                                        f"WHERE id = '{job.ingestion_id}' RETURNING id"
+                                    )
                                 },
                             )
 
-                            # Invoke worker for next file
                             remaining = sum(1 for f in pf if f.get("status") == "pending")
                             if remaining > 0:
+                                # Trigger worker for the next pending file
                                 await client.post(
                                     f"{job.supabase_url}/functions/v1/ingest-worker",
                                     headers={
@@ -579,6 +693,7 @@ async def ocr_worker_process(job: OcrJobRequest):
                                     },
                                 )
                             else:
+                                # All files processed — set final ingestion status
                                 final_status = "failed" if ec == len(pf) else "completed"
                                 await client.post(
                                     f"{job.supabase_url}/rest/v1/rpc/execute_tenant_query",
@@ -588,11 +703,27 @@ async def ocr_worker_process(job: OcrJobRequest):
                                         "Content-Type": "application/json",
                                     },
                                     json={
-                                        "p_query": f"UPDATE {schema}.ingestions SET status = '{final_status}', updated_at = now() WHERE id = '{job.ingestion_id}' RETURNING id"
+                                        "p_query": (
+                                            f"UPDATE {schema}.ingestions "
+                                            f"SET status = '{final_status}', "
+                                            f"updated_at = now() "
+                                            f"WHERE id = '{job.ingestion_id}' RETURNING id"
+                                        )
                                     },
                                 )
         except Exception as db_err:
             print(f"[ocr-worker] Error updating DB on failure: {db_err}")
+
+    finally:
+        # Always remove the temp PDF file — this runs even if the job was
+        # cancelled, raised an unhandled exception, or returned early.
+        # Without this, a 500 MB file would linger in /tmp after every failure.
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+                print(f"[ocr-worker] Temp file removed: {tmp_path}")
+            except Exception as cleanup_err:
+                print(f"[ocr-worker] Failed to remove temp file {tmp_path}: {cleanup_err}")
 
 
 # ── Endpoints ──────────────────────────────────────────────────
@@ -604,7 +735,6 @@ async def health():
     storage_ok = Path(STORAGE_ROOT).exists()
     poppler_ok = shutil.which("pdftoppm") is not None
 
-    # Count tenants & files on disk
     root = Path(STORAGE_ROOT)
     tenant_count = sum(1 for d in root.iterdir() if d.is_dir()) if root.exists() else 0
 
@@ -632,13 +762,13 @@ async def submit_ocr_job(
 ):
     """
     Submit a large PDF for background OCR processing.
-    The worker will process pages, update DB progress, and callback pipeline when done.
+    The worker streams the file to disk, processes pages in chunks to keep
+    RAM bounded, updates DB progress, and calls back the pipeline when done.
     """
     verify_api_key(x_api_key)
 
     job_id = f"{req.ingestion_id}_{req.file_index}"
 
-    # Check if job already running
     if job_id in ocr_jobs and ocr_jobs[job_id]["status"] == "processing":
         return JSONResponse(status_code=409, content={
             "error": "Job already running",
@@ -646,7 +776,6 @@ async def submit_ocr_job(
             "status": ocr_jobs[job_id],
         })
 
-    # Start background processing
     background_tasks.add_task(ocr_worker_process, req)
 
     return JSONResponse(status_code=202, content={
@@ -684,7 +813,6 @@ async def list_ocr_jobs(x_api_key: str = Header(...)):
 
 
 # ── Upload ─────────────────────────────────────────────────────
-# ... keep existing code (all upload, download, list, delete, stats endpoints)
 
 
 @app.post("/upload/{tenant_slug}/{kb_id}/{doc_id}")
@@ -803,7 +931,6 @@ async def download_file(
 
     ext = file_path.suffix.lower()
     media_type = MIME_MAP.get(ext, "application/octet-stream")
-
     disposition = "attachment" if download else "inline"
 
     return FileResponse(
