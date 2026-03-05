@@ -58,7 +58,7 @@ ocr_jobs: Dict[str, Dict[str, Any]] = {}
 
 app = FastAPI(
     title="BlueBox File Receiver",
-    version="4.2.0",
+    version="4.3.0",
     description="Tenant-isolated file storage + PDF-to-images + Background OCR Worker",
 )
 
@@ -278,9 +278,14 @@ async def ocr_call_gemini(
         system_prompt = (
             "Jestes ekspertem od ekstrakcji tresci z dokumentow. Wykonaj DWA zadania:\n"
             "1. EKSTRAKCJA TEKSTU: Przepisz dokladnie CALY tekst w Markdown.\n"
-            "2. DETEKCJA OBRAZOW: Zidentyfikuj elementy graficzne. "
-            f"Dla kazdego podaj typ i opis (max {image_desc_tokens} tokenow). Pusta lista jesli brak.\n\n"
-            'Odpowiedz WYLACZNIE JSON:\n{"text": "...", "images": [{"type": "...", "description": "..."}]}'
+            "2. DETEKCJA OBRAZOW: Zidentyfikuj elementy graficzne (zdjecia, wykresy, diagramy, schematy, logo). "
+            "NIE oznaczaj tabel, naglowkow, stopek ani dekoracji jako obrazy.\n"
+            f"Dla kazdego obrazu podaj typ, opis (max {image_desc_tokens} tokenow) "
+            "oraz wspolrzedne bbox jako [y_min, x_min, y_max, x_max] w skali 0-1000 "
+            "(0,0 = lewy gorny rog, 1000,1000 = prawy dolny rog). "
+            "Pusta lista jesli brak obrazow.\n\n"
+            'Odpowiedz WYLACZNIE JSON:\n'
+            '{"text": "...", "images": [{"type": "...", "description": "...", "bbox": [y_min, x_min, y_max, x_max]}]}'
         )
     else:
         system_prompt = (
@@ -560,6 +565,11 @@ async def ocr_worker_process(job: OcrJobRequest):
         image_desc_tokens = job.settings.get("imageDescTokens", 200)
         pages_done = 0
 
+        # Directory for cropped image files (individual images detected by Gemini)
+        pages_dir = ocr_dir / "_images"
+        if extract_images:
+            pages_dir.mkdir(parents=True, exist_ok=True)
+
         # ── Step 4: Rasterise and OCR in chunks ────────────────────────────────
         for chunk_start_0 in range(0, total_pages, PDF_CHUNK_SIZE):
             chunk_end_0 = min(chunk_start_0 + PDF_CHUNK_SIZE, total_pages)
@@ -616,19 +626,68 @@ async def ocr_worker_process(job: OcrJobRequest):
                         print(f"[ocr-worker] Heartbeat error: {hb_err}")
 
                 async def process_page(local_idx: int) -> Dict:
-                    """Encode one PIL Image to JPEG/base64 and OCR it."""
+                    """Encode one PIL Image to JPEG/base64, OCR it, crop detected images."""
                     global_page_num = chunk_start_0 + local_idx + 1  # 1-based
                     img = chunk_images[local_idx]
+                    img_width, img_height = img.size
 
                     buf = io.BytesIO()
                     img.save(buf, format="JPEG", quality=85)
-                    img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+                    jpeg_bytes = buf.getvalue()
+                    img_b64 = base64.b64encode(jpeg_bytes).decode("utf-8")
                     buf.close()
+                    del jpeg_bytes
 
                     result = await _ocr_page_with_retry(
                         img_b64, job, extract_images, image_desc_tokens, global_page_num,
                     )
-                    return {"page_num": global_page_num, "result": result}
+
+                    # Crop and save detected images based on bounding boxes
+                    cropped_images = []
+                    for img_idx, img_info in enumerate(result.get("images", [])):
+                        bbox = img_info.get("bbox")
+                        if not bbox or len(bbox) != 4:
+                            cropped_images.append(None)
+                            continue
+
+                        try:
+                            # Gemini bbox: [y_min, x_min, y_max, x_max] in 0-1000 scale
+                            y_min, x_min, y_max, x_max = bbox
+
+                            # Add 3% padding to avoid cutting edges
+                            pad_x = int((x_max - x_min) * 0.03)
+                            pad_y = int((y_max - y_min) * 0.03)
+                            x_min = max(0, x_min - pad_x)
+                            y_min = max(0, y_min - pad_y)
+                            x_max = min(1000, x_max + pad_x)
+                            y_max = min(1000, y_max + pad_y)
+
+                            # Convert from 0-1000 scale to pixel coordinates
+                            left = int(x_min / 1000 * img_width)
+                            upper = int(y_min / 1000 * img_height)
+                            right = int(x_max / 1000 * img_width)
+                            lower = int(y_max / 1000 * img_height)
+
+                            # Validate crop area (min 20x20 pixels)
+                            if (right - left) < 20 or (lower - upper) < 20:
+                                print(f"[ocr-worker] Page {global_page_num} img {img_idx}: bbox too small, skipping crop")
+                                cropped_images.append(None)
+                                continue
+
+                            cropped = img.crop((left, upper, right, lower))
+                            crop_filename = f"page_{global_page_num:04d}_img_{img_idx:02d}.jpg"
+                            crop_path = pages_dir / crop_filename
+                            cropped.save(str(crop_path), format="JPEG", quality=90)
+                            cropped_images.append(crop_filename)
+                        except Exception as crop_err:
+                            print(f"[ocr-worker] Page {global_page_num} img {img_idx}: crop failed: {crop_err}")
+                            cropped_images.append(None)
+
+                    return {
+                        "page_num": global_page_num,
+                        "result": result,
+                        "cropped_images": cropped_images,
+                    }
 
                 tasks = [process_page(idx) for idx in range(batch_start, batch_end)]
                 results = await asyncio.gather(*tasks)
@@ -636,6 +695,7 @@ async def ocr_worker_process(job: OcrJobRequest):
                 for r in results:
                     page_num = r["page_num"]
                     text = r["result"].get("text", "")
+                    cropped = r.get("cropped_images", [])
                     pages_done += 1
 
                     # Write text result immediately to JSONL — no in-memory accumulation
@@ -645,17 +705,25 @@ async def ocr_worker_process(job: OcrJobRequest):
                         )
 
                     # Write detected image metadata to separate JSONL
-                    for img_info in r["result"].get("images", []):
+                    for img_idx, img_info in enumerate(r["result"].get("images", [])):
+                        crop_filename = cropped[img_idx] if img_idx < len(cropped) else None
+                        img_entry = {
+                            "description": (
+                                f"[Image: {img_info.get('type', 'unknown')}, "
+                                f"page {page_num}] {img_info.get('description', '')}"
+                            ),
+                            "section_context": text[:1000] if text else "",
+                            "page": page_num,
+                            "bbox": img_info.get("bbox"),
+                        }
+                        if crop_filename:
+                            img_entry["image_url"] = (
+                                f"/files/{tenant_slug}/{job.knowledge_base_id}/"
+                                f"{job.file_id or 'unknown'}/_images/{crop_filename}"
+                            )
                         with open(images_jsonl, "a", encoding="utf-8") as fh:
                             fh.write(
-                                json.dumps({
-                                    "description": (
-                                        f"[Image: {img_info.get('type', 'unknown')}, "
-                                        f"page {page_num}] {img_info.get('description', '')}"
-                                    ),
-                                    "section_context": text[:1000] if text else "",
-                                    "page": page_num,
-                                }, ensure_ascii=False) + "\n"
+                                json.dumps(img_entry, ensure_ascii=False) + "\n"
                             )
 
                 ocr_jobs[job_id]["pages_done"] = pages_done
@@ -693,6 +761,12 @@ async def ocr_worker_process(job: OcrJobRequest):
             f"{len(all_images)} images from {total_pages} pages"
         )
 
+        # Count saved cropped images
+        cropped_count = 0
+        if extract_images and pages_dir.exists():
+            cropped_count = len(list(pages_dir.glob("page_*_img_*.jpg")))
+            print(f"[ocr-worker] Saved {cropped_count} cropped images to {pages_dir}")
+
         # Save assembled result to persistent file storage
         ocr_result_file = ocr_dir / "_ocr_result.json"
         with open(ocr_result_file, "w", encoding="utf-8") as fh:
@@ -701,6 +775,7 @@ async def ocr_worker_process(job: OcrJobRequest):
                     "document_text": full_text,
                     "_ocr_images": all_images,
                     "_ocr_page_count": total_pages,
+                    "_cropped_images_count": cropped_count,
                 },
                 fh,
                 ensure_ascii=False,

@@ -2,6 +2,9 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+# Disable stdout buffering so logs appear in real-time in kubectl logs
+ENV PYTHONUNBUFFERED=1
+
 # Install poppler for PDF-to-image conversion (pdf2image)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends poppler-utils && \
