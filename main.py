@@ -21,6 +21,7 @@ import uuid
 import shutil
 import asyncio
 import traceback
+import urllib.parse
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, Any
@@ -56,7 +57,7 @@ ocr_jobs: Dict[str, Dict[str, Any]] = {}
 
 app = FastAPI(
     title="BlueBox File Receiver",
-    version="4.1.0",
+    version="4.2.0",
     description="Tenant-isolated file storage + PDF-to-images + Background OCR Worker",
 )
 
@@ -198,6 +199,55 @@ MIME_MAP = {
     ".rtf": "application/rtf",
     ".odt": "application/vnd.oasis.opendocument.text",
 }
+
+
+def _resolve_local_path(download_url: str) -> Optional[Path]:
+    """
+    If download_url points to this file-receiver instance, return the local
+    file path on disk instead of making an HTTP round-trip.
+
+    Recognises:
+      - FILE_RECEIVER_URL env var (e.g. https://file-receiver.agentic.pl)
+      - http://127.0.0.1:8000, http://localhost:8000
+      - http://file-receiver-service:8000 (k8s in-cluster)
+    """
+    file_receiver_url = os.getenv("FILE_RECEIVER_URL", "").rstrip("/")
+    self_prefixes = [
+        "http://127.0.0.1:8000",
+        "http://localhost:8000",
+        "http://file-receiver-service:8000",
+        "http://file-receiver-service.bbx331.svc.cluster.local:8000",
+    ]
+    if file_receiver_url:
+        self_prefixes.append(file_receiver_url)
+
+    for prefix in self_prefixes:
+        if download_url.startswith(prefix):
+            # Extract path after the prefix, e.g. /files/tenant/kb/doc/file.pdf
+            url_path = download_url[len(prefix):]
+            # Remove query string (?download=true etc.)
+            url_path = url_path.split("?")[0]
+            # URL path starts with /files/ — map to STORAGE_ROOT
+            if url_path.startswith("/files/"):
+                relative = url_path[len("/files/"):]
+                # URL-decode the path components (e.g. %20 → space)
+                relative = urllib.parse.unquote(relative)
+                local = Path(STORAGE_ROOT) / relative
+                if local.exists() and local.is_file():
+                    return local
+            break  # matched a self-prefix but file not found locally
+    return None
+
+
+def _rewrite_to_localhost(download_url: str) -> str:
+    """
+    Rewrite an external file-receiver URL to http://127.0.0.1:8000 so the
+    OCR worker can reach the file without going through external DNS/ingress.
+    """
+    file_receiver_url = os.getenv("FILE_RECEIVER_URL", "").rstrip("/")
+    if file_receiver_url and download_url.startswith(file_receiver_url):
+        return download_url.replace(file_receiver_url, "http://127.0.0.1:8000", 1)
+    return download_url
 
 
 # ══════════════════════════════════════════════════════════════
@@ -439,14 +489,27 @@ async def ocr_worker_process(job: OcrJobRequest):
         tmp_path = f"/tmp/ocr_{job_id}_{uuid.uuid4().hex}.pdf"
 
         if job.file_download_url:
-            # Stream directly to disk — avoids holding the full body in RAM
-            print(f"[ocr-worker] Streaming download → {tmp_path}")
-            async with httpx.AsyncClient(timeout=300) as client:
-                async with client.stream("GET", job.file_download_url) as resp:
-                    resp.raise_for_status()
-                    with open(tmp_path, "wb") as fh:
-                        async for chunk in resp.aiter_bytes(chunk_size=1024 * 1024):
-                            fh.write(chunk)
+            # Try to resolve the URL to a local file path first (zero I/O overhead)
+            local_path = _resolve_local_path(job.file_download_url)
+            if local_path:
+                print(f"[ocr-worker] Local file found → copying {local_path} → {tmp_path}")
+                shutil.copy2(str(local_path), tmp_path)
+            else:
+                # Rewrite self-referencing URLs to localhost to avoid external DNS/ingress
+                actual_url = _rewrite_to_localhost(job.file_download_url)
+                if actual_url != job.file_download_url:
+                    print(f"[ocr-worker] Rewritten URL: {job.file_download_url} → {actual_url}")
+
+                # Stream directly to disk — avoids holding the full body in RAM
+                print(f"[ocr-worker] Streaming download → {tmp_path}")
+                async with httpx.AsyncClient(timeout=300) as client:
+                    async with client.stream("GET", actual_url, headers={
+                        "X-Api-Key": API_KEY,
+                    }) as resp:
+                        resp.raise_for_status()
+                        with open(tmp_path, "wb") as fh:
+                            async for chunk in resp.aiter_bytes(chunk_size=1024 * 1024):
+                                fh.write(chunk)
 
         elif job.file_base64:
             # Decode base64 payload and immediately flush to disk
@@ -1019,11 +1082,21 @@ async def download_file(
     media_type = MIME_MAP.get(ext, "application/octet-stream")
     disposition = "attachment" if download else "inline"
 
+    # RFC 5987: use ASCII fallback + UTF-8 encoded filename to avoid
+    # latin-1 encoding errors with non-ASCII characters (e.g. Polish ń, ó)
+    ascii_filename = filename.encode("ascii", "ignore").decode("ascii").strip() or "download"
+    utf8_filename = urllib.parse.quote(filename)
+
     return FileResponse(
         path=str(file_path),
         media_type=media_type,
-        filename=filename,
-        headers={"Content-Disposition": f'{disposition}; filename="{filename}"'},
+        # Do not pass filename= to FileResponse — we set Content-Disposition manually
+        headers={
+            "Content-Disposition": (
+                f'{disposition}; filename="{ascii_filename}"; '
+                f"filename*=UTF-8''{utf8_filename}"
+            )
+        },
     )
 
 
