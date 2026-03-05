@@ -25,7 +25,6 @@ import urllib.parse
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, Any
-import logging
 
 from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Query, BackgroundTasks
 from fastapi.responses import JSONResponse, FileResponse
@@ -991,13 +990,13 @@ async def submit_ocr_job(
     RAM bounded, updates DB progress, and calls back the pipeline when done.
     """
     verify_api_key(x_api_key)
-    logging.info(f"lovable_api_key: {req.lovable_api_key}")
-    logging.info(f"supabase_service_role_key: {req.supabase_service_role_key}")
-    logging.info(f"tenant_id: {req.tenant_id}")
-    logging.info(f"ingestion_id: {req.ingestion_id}")
-    logging.info(f"supabase_anon_key: {req.supabase_anon_key}")
-    logging.info(f"file_download_url: {req.file_download_url}")
-    logging.info(f"callback_url: {req.callback_url}")
+    print(f"lovable_api_key: {req.lovable_api_key}")
+    print(f"supabase_service_role_key: {req.supabase_service_role_key}")
+    print(f"tenant_id: {req.tenant_id}")
+    print(f"ingestion_id: {req.ingestion_id}")
+    print(f"supabase_anon_key: {req.supabase_anon_key}")
+    print(f"file_download_url: {req.file_download_url}")
+    print(f"callback_url: {req.callback_url}")
 
     job_id = f"{req.ingestion_id}_{req.file_index}"
 
@@ -1139,7 +1138,7 @@ async def upload_file_legacy(
     })
 
 
-@app.get("/files/{tenant_slug}/{kb_id}/{doc_id}/{filename}")
+@app.get("/files/{tenant_slug}/{kb_id}/{doc_id}/{filename:path}")
 async def download_file(
     tenant_slug: str,
     kb_id: str,
@@ -1149,7 +1148,7 @@ async def download_file(
     x_tenant: Optional[str] = Header(None),
     download: bool = Query(False, description="Force download instead of inline display"),
 ):
-    """Serve/download a specific file."""
+    """Serve/download a specific file. Supports nested paths (e.g. _images/page_0001_img_00.jpg)."""
     verify_api_key(x_api_key)
     verify_tenant(tenant_slug, x_tenant)
 
@@ -1161,14 +1160,16 @@ async def download_file(
     if not str(file_path.resolve()).startswith(str(Path(STORAGE_ROOT).resolve())):
         raise HTTPException(status_code=403, detail="Access denied")
 
+    # Use only the basename for Content-Disposition (not the subpath)
+    display_name = Path(filename).name
     ext = file_path.suffix.lower()
     media_type = MIME_MAP.get(ext, "application/octet-stream")
     disposition = "attachment" if download else "inline"
 
     # RFC 5987: use ASCII fallback + UTF-8 encoded filename to avoid
     # latin-1 encoding errors with non-ASCII characters (e.g. Polish ń, ó)
-    ascii_filename = filename.encode("ascii", "ignore").decode("ascii").strip() or "download"
-    utf8_filename = urllib.parse.quote(filename)
+    ascii_filename = display_name.encode("ascii", "ignore").decode("ascii").strip() or "download"
+    utf8_filename = urllib.parse.quote(display_name)
 
     return FileResponse(
         path=str(file_path),
@@ -1277,7 +1278,7 @@ async def delete_document(
     return {"deleted": True, "doc_id": doc_id}
 
 
-@app.delete("/files/{tenant_slug}/{kb_id}/{doc_id}/{filename}")
+@app.delete("/files/{tenant_slug}/{kb_id}/{doc_id}/{filename:path}")
 async def delete_single_file(
     tenant_slug: str,
     kb_id: str,
@@ -1286,7 +1287,7 @@ async def delete_single_file(
     x_api_key: str = Header(...),
     x_tenant: Optional[str] = Header(None),
 ):
-    """Delete a single file from a document directory."""
+    """Delete a single file from a document directory. Supports nested paths."""
     verify_api_key(x_api_key)
     verify_tenant(tenant_slug, x_tenant)
 
