@@ -25,6 +25,7 @@ import urllib.parse
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, Any
+import logging
 
 from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Query, BackgroundTasks
 from fastapi.responses import JSONResponse, FileResponse
@@ -915,6 +916,13 @@ async def submit_ocr_job(
     RAM bounded, updates DB progress, and calls back the pipeline when done.
     """
     verify_api_key(x_api_key)
+    logging.info(f"lovable_api_key: {req.lovable_api_key}")
+    logging.info(f"supabase_service_role_key: {req.supabase_service_role_key}")
+    logging.info(f"tenant_id: {req.tenant_id}")
+    logging.info(f"ingestion_id: {req.ingestion_id}")
+    logging.info(f"supabase_anon_key: {req.supabase_anon_key}")
+    logging.info(f"file_download_url: {req.file_download_url}")
+    logging.info(f"callback_url: {req.callback_url}")
 
     job_id = f"{req.ingestion_id}_{req.file_index}"
 
