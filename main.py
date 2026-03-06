@@ -2,8 +2,8 @@
 BlueBox File Receiver Service
 Receives files from Lovable Cloud edge functions and stores them
 in tenant-isolated directories for the ingestion pipeline.
-Also provides PDF-to-images conversion for page-by-page OCR.
-Includes background OCR Worker for large scanned documents.
+Also provides PDF-to-images conversion for page-by-page OCR,
+EPUB text extraction, and a background OCR Worker for large scanned documents.
 
 Storage layout:
   /data/files/{tenant_slug}/{kb_id}/{doc_id}/{filename}
@@ -17,11 +17,15 @@ import functools
 import io
 import json
 import os
+import re
 import uuid
 import shutil
 import asyncio
 import traceback
 import urllib.parse
+import zipfile
+import xml.etree.ElementTree as ET
+from html.parser import HTMLParser
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, Any
@@ -57,8 +61,8 @@ ocr_jobs: Dict[str, Dict[str, Any]] = {}
 
 app = FastAPI(
     title="BlueBox File Receiver",
-    version="4.3.0",
-    description="Tenant-isolated file storage + PDF-to-images + Background OCR Worker",
+    version="4.4.0",
+    description="Tenant-isolated file storage + PDF-to-images + EPUB extraction + Background OCR Worker",
 )
 
 
@@ -111,6 +115,106 @@ class OcrJobRequest(BaseModel):
 
     # Callback: pipeline URL to call when OCR is done
     callback_url: str
+
+
+class EpubExtractRequest(BaseModel):
+    """Request body for extracting text from an EPUB file."""
+    file_download_url: Optional[str] = None
+    file_base64: Optional[str] = None
+    file_name: str = "book.epub"
+
+
+# ── EPUB helpers ───────────────────────────────────────────────
+
+
+class _HTMLToText(HTMLParser):
+    """Minimal HTML→Markdown-like text converter preserving headers and lists."""
+
+    def __init__(self):
+        super().__init__()
+        self._parts: list[str] = []
+        self._tag_stack: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        self._tag_stack.append(tag)
+        if tag == "h1":
+            self._parts.append("\n# ")
+        elif tag == "h2":
+            self._parts.append("\n## ")
+        elif tag == "h3":
+            self._parts.append("\n### ")
+        elif tag in ("h4", "h5", "h6"):
+            self._parts.append("\n#### ")
+        elif tag == "li":
+            self._parts.append("- ")
+        elif tag == "br":
+            self._parts.append("\n")
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if self._tag_stack and self._tag_stack[-1] == tag:
+            self._tag_stack.pop()
+        if tag in ("p", "div", "li", "h1", "h2", "h3", "h4", "h5", "h6", "tr"):
+            self._parts.append("\n")
+
+    def handle_data(self, data):
+        self._parts.append(data)
+
+    def get_text(self) -> str:
+        text = "".join(self._parts)
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+
+
+def _parse_epub_bytes(data: bytes) -> tuple[str, int]:
+    """
+    Parse EPUB ZIP bytes → Markdown text following OPF spine order.
+    Returns (full_text, chapter_count).
+    """
+    zf = zipfile.ZipFile(io.BytesIO(data))
+
+    # 1. container.xml → rootfile
+    container = ET.fromstring(zf.read("META-INF/container.xml"))
+    ns = {"c": "urn:oasis:names:tc:opendocument:xmlns:container"}
+    rootfile_el = container.find(".//c:rootfile", ns)
+    if rootfile_el is None:
+        rootfile_el = container.find(".//{*}rootfile")
+    if rootfile_el is None:
+        raise ValueError("Invalid EPUB: cannot find rootfile in container.xml")
+
+    opf_path = rootfile_el.attrib["full-path"]
+    opf_dir = os.path.dirname(opf_path)
+    if opf_dir:
+        opf_dir += "/"
+
+    # 2. Parse OPF — manifest and spine
+    opf = ET.fromstring(zf.read(opf_path))
+    manifest = {}
+    for item in opf.findall(".//{*}item"):
+        manifest[item.attrib.get("id", "")] = item.attrib.get("href", "")
+    spine_ids = [ref.attrib["idref"] for ref in opf.findall(".//{*}itemref")]
+
+    # 3. Extract chapters in spine order
+    chapters: list[str] = []
+    for sid in spine_ids:
+        href = manifest.get(sid)
+        if not href:
+            continue
+        full_path = opf_dir + href if opf_dir else href
+        matching = [n for n in zf.namelist() if n.lower() == full_path.lower()]
+        if not matching:
+            continue
+        html_bytes = zf.read(matching[0])
+        parser = _HTMLToText()
+        parser.feed(html_bytes.decode("utf-8", errors="replace"))
+        text = parser.get_text()
+        if text.strip():
+            chapters.append(text.strip())
+
+    full_text = "\n\n---\n\n".join(chapters)
+    return full_text, len(chapters)
 
 
 # ── Auth & tenant guard ───────────────────────────────────────
@@ -198,6 +302,7 @@ MIME_MAP = {
     ".md": "text/markdown",
     ".rtf": "application/rtf",
     ".odt": "application/vnd.oasis.opendocument.text",
+    ".epub": "application/epub+zip",
 }
 
 
@@ -1436,4 +1541,68 @@ async def pdf_to_images(req: PdfToImagesRequest, x_api_key: str = Header(...)):
         "pages": result_pages,
         "total_pages": len(result_pages),
         "dpi": req.dpi,
+    }
+
+
+# ── EPUB extraction ───────────────────────────────────────────
+
+
+@app.post("/extract-epub")
+async def extract_epub(req: EpubExtractRequest, x_api_key: str = Header(...)):
+    """
+    Extract text from an EPUB file.
+
+    Accepts either a download URL (file_download_url) or raw base64 payload
+    (file_base64).  When the URL points to this file-receiver instance the
+    file is read directly from disk (zero network overhead).
+
+    Returns { text, chars, chapters, file_name }.
+    """
+    verify_api_key(x_api_key)
+
+    epub_bytes: Optional[bytes] = None
+
+    if req.file_download_url:
+        # Try local path first (avoids HTTP round-trip for files already on disk)
+        local_path = _resolve_local_path(req.file_download_url)
+        if local_path:
+            print(f"[extract-epub] Reading local file: {local_path}")
+            epub_bytes = local_path.read_bytes()
+        else:
+            actual_url = _rewrite_to_localhost(req.file_download_url)
+            if actual_url != req.file_download_url:
+                print(f"[extract-epub] Rewritten URL: {req.file_download_url} → {actual_url}")
+            print(f"[extract-epub] Downloading: {actual_url}")
+            async with httpx.AsyncClient(timeout=120) as client:
+                resp = await client.get(actual_url, headers={"X-Api-Key": API_KEY})
+                resp.raise_for_status()
+                epub_bytes = resp.content
+
+    elif req.file_base64:
+        try:
+            epub_bytes = base64.b64decode(req.file_base64)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid base64 EPUB data")
+
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide file_download_url or file_base64",
+        )
+
+    if len(epub_bytes) > MAX_FILE_SIZE_MB * 1024 * 1024:
+        raise HTTPException(status_code=413, detail=f"EPUB too large. Max: {MAX_FILE_SIZE_MB}MB")
+
+    try:
+        text, chapter_count = _parse_epub_bytes(epub_bytes)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"EPUB parsing failed: {e}")
+
+    print(f"[extract-epub] {req.file_name}: {len(text)} chars, {chapter_count} chapters")
+
+    return {
+        "text": text,
+        "chars": len(text),
+        "chapters": chapter_count,
+        "file_name": req.file_name,
     }
