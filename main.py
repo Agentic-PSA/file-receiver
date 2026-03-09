@@ -48,6 +48,9 @@ PDF_DPI = int(os.getenv("PDF_DPI", "150"))
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = "gemini-2.5-flash"
+OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = "gpt-4o-mini"
 QWEN_API_URL = "https://qwen.agentic.pl/v1/chat/completions"
 QWEN_MODEL = "Qwen/Qwen2.5-VL-7B-Instruct"
 
@@ -66,10 +69,9 @@ epub_jobs: Dict[str, Dict[str, Any]] = {}
 
 app = FastAPI(
     title="BlueBox File Receiver",
-    version="4.6.0",
+    version="4.7.0",
     description="Tenant-isolated file storage + PDF-to-images + Background OCR Worker + Background EPUB extraction",
 )
-
 
 # ── Models ─────────────────────────────────────────────────────
 
@@ -79,14 +81,12 @@ class FileStatus(str, Enum):
     ingested = "ingested"
     failed = "failed"
 
-
 class PdfToImagesRequest(BaseModel):
     """Request body for PDF-to-images conversion (base64)."""
     pdf_base64: str
     dpi: int = 150
     quality: int = 85
     pages: Optional[str] = None  # "all", "1-5", "3"
-
 
 class OcrJobRequest(BaseModel):
     """Request body for submitting an OCR job."""
@@ -121,7 +121,6 @@ class OcrJobRequest(BaseModel):
     # Callback: pipeline URL to call when OCR is done
     callback_url: str
 
-
 class EpubExtractRequest(BaseModel):
     """Request body for submitting an EPUB extraction job."""
     # Source
@@ -154,9 +153,7 @@ class EpubExtractRequest(BaseModel):
     # Callback: pipeline URL to call when extraction is done
     callback_url: str
 
-
 # ── EPUB helpers ───────────────────────────────────────────────
-
 
 class _HTMLToText(HTMLParser):
     """Minimal HTML→Markdown-like text converter preserving headers, lists, and image references."""
@@ -206,7 +203,6 @@ class _HTMLToText(HTMLParser):
         text = re.sub(r"[ \t]+", " ", text)
         text = re.sub(r"\n{3,}", "\n\n", text)
         return text.strip()
-
 
 def _parse_epub_bytes(data: bytes) -> tuple[str, int, list[dict]]:
     """
@@ -296,19 +292,16 @@ def _parse_epub_bytes(data: bytes) -> tuple[str, int, list[dict]]:
     full_text = "\n\n---\n\n".join(chapters)
     return full_text, len(chapters), all_images
 
-
 # ── Auth & tenant guard ───────────────────────────────────────
 
 def verify_api_key(x_api_key: str = Header(...)):
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-
 def verify_tenant(path_tenant: str, x_tenant: Optional[str] = None):
     """Ensure the X-Tenant header matches the path tenant_slug (if provided)."""
     if x_tenant and x_tenant != path_tenant:
         raise HTTPException(status_code=403, detail="Tenant mismatch")
-
 
 # ── Helpers ────────────────────────────────────────────────────
 
@@ -318,12 +311,10 @@ def get_doc_path(tenant_slug: str, kb_id: str, doc_id: str) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     return path
 
-
 def get_kb_path(tenant_slug: str, kb_id: str) -> Path:
     path = Path(STORAGE_ROOT) / tenant_slug / kb_id
     path.mkdir(parents=True, exist_ok=True)
     return path
-
 
 def write_metadata(doc_path: Path, metadata: dict):
     """Write/update metadata.json in the document directory."""
@@ -338,7 +329,6 @@ def write_metadata(doc_path: Path, metadata: dict):
     existing["updated_at"] = datetime.utcnow().isoformat() + "Z"
     meta_file.write_text(json.dumps(existing, ensure_ascii=False, indent=2))
 
-
 def read_metadata(doc_path: Path) -> dict:
     meta_file = doc_path / "metadata.json"
     if meta_file.exists():
@@ -347,7 +337,6 @@ def read_metadata(doc_path: Path) -> dict:
         except Exception:
             pass
     return {}
-
 
 def parse_pages(pages_str: Optional[str]) -> tuple | None:
     """Parse page range: None/'all' → None, '1-5' → (1, 5), '3' → (3, 3)."""
@@ -358,7 +347,6 @@ def parse_pages(pages_str: Optional[str]) -> tuple | None:
         p = int(parts[0])
         return (p, p)
     return (int(parts[0]), int(parts[1]))
-
 
 MIME_MAP = {
     ".pdf": "application/pdf",
@@ -385,7 +373,6 @@ MIME_MAP = {
     ".epub": "application/epub+zip",
     ".mobi": "application/x-mobipocket-ebook",
 }
-
 
 def _resolve_local_path(download_url: str) -> Optional[Path]:
     """
@@ -424,7 +411,6 @@ def _resolve_local_path(download_url: str) -> Optional[Path]:
             break  # matched a self-prefix but file not found locally
     return None
 
-
 def _rewrite_to_localhost(download_url: str) -> str:
     """
     Rewrite an external file-receiver URL to http://127.0.0.1:8000 so the
@@ -435,11 +421,112 @@ def _rewrite_to_localhost(download_url: str) -> str:
         return download_url.replace(file_receiver_url, "http://127.0.0.1:8000", 1)
     return download_url
 
+# ══════════════════════════════════════════════════════════════
+# AI Vision call with provider chain (Gemini → OpenAI fallback)
+# ══════════════════════════════════════════════════════════════
+
+async def _call_vision_with_fallback(
+    messages: list,
+    max_tokens: int = 8000,
+    temperature: float = 0,
+    force_qwen: bool = False,
+    qwen_api_key: Optional[str] = None,
+) -> dict:
+    """
+    Call a vision-capable LLM with automatic fallback.
+    Provider chain: Qwen (if forced) → Gemini → OpenAI.
+    Returns the parsed JSON response from the API.
+    Raises on total failure.
+    """
+    providers = []
+
+    if force_qwen and qwen_api_key:
+        providers.append({
+            "url": QWEN_API_URL,
+            "key": qwen_api_key,
+            "model": QWEN_MODEL,
+            "name": "Qwen",
+            "max_retries": 2,
+        })
+    else:
+        if GEMINI_API_KEY:
+            providers.append({
+                "url": GEMINI_API_URL,
+                "key": GEMINI_API_KEY,
+                "model": GEMINI_MODEL,
+                "name": "Gemini",
+                "max_retries": 3,
+            })
+        if OPENAI_API_KEY:
+            providers.append({
+                "url": OPENAI_API_URL,
+                "key": OPENAI_API_KEY,
+                "model": OPENAI_MODEL,
+                "name": "OpenAI",
+                "max_retries": 2,
+            })
+
+    if not providers:
+        raise ValueError("No AI API keys configured (GEMINI_API_KEY or OPENAI_API_KEY required)")
+
+    last_error = None
+
+    for provider in providers:
+        for attempt in range(provider["max_retries"] + 1):
+            try:
+                async with httpx.AsyncClient(timeout=120) as client:
+                    resp = await client.post(
+                        provider["url"],
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": f"Bearer {provider['key']}",
+                        },
+                        json={
+                            "model": provider["model"],
+                            "messages": messages,
+                            "max_tokens": max_tokens,
+                            "temperature": temperature,
+                        },
+                    )
+
+                    if resp.status_code == 200:
+                        if provider["name"] != "Gemini":
+                            print(f"[vision] Used {provider['name']} (attempt {attempt + 1})")
+                        return resp.json()
+
+                    if resp.status_code in (429, 503) and attempt < provider["max_retries"]:
+                        wait = min(10 * (attempt + 1), 30)
+                        print(f"[vision] {provider['name']} {resp.status_code}, retry {attempt + 1}/{provider['max_retries']} in {wait}s")
+                        await resp.aread()
+                        await asyncio.sleep(wait)
+                        continue
+
+                    if resp.status_code in (429, 503):
+                        print(f"[vision] {provider['name']} exhausted retries ({resp.status_code}), trying next provider...")
+                        await resp.aread()
+                        last_error = f"{provider['name']} {resp.status_code}"
+                        break  # next provider
+
+                    # Non-retryable error
+                    resp.raise_for_status()
+
+            except httpx.HTTPStatusError as e:
+                last_error = f"{provider['name']}: {e.response.status_code}"
+                if e.response.status_code in (429, 503):
+                    break  # next provider
+                raise
+            except Exception as e:
+                last_error = f"{provider['name']}: {e}"
+                if attempt < provider["max_retries"]:
+                    await asyncio.sleep(5)
+                else:
+                    break  # next provider
+
+    raise RuntimeError(f"All AI providers failed. Last error: {last_error}")
 
 # ══════════════════════════════════════════════════════════════
 # OCR Worker — Background Processing
 # ══════════════════════════════════════════════════════════════
-
 
 async def ocr_call_gemini(
     image_base64: str,
@@ -449,18 +536,7 @@ async def ocr_call_gemini(
     extract_images: bool = False,
     image_desc_tokens: int = 200,
 ) -> Dict[str, Any]:
-    """Call Gemini/Qwen Vision API for a single page image OCR."""
-    if anonymize and qwen_api_key:
-        api_url = QWEN_API_URL
-        api_key_val = qwen_api_key
-        model = QWEN_MODEL
-    else:
-        if not GEMINI_API_KEY:
-            raise ValueError("GEMINI_API_KEY is not configured — set it in environment variables")
-        api_url = GEMINI_API_URL
-        api_key_val = GEMINI_API_KEY
-        model = GEMINI_MODEL
-
+    """Call Vision API for a single page image OCR with Gemini→OpenAI fallback."""
     if extract_images:
         system_prompt = (
             "Jestes ekspertem od ekstrakcji tresci z dokumentow. Wykonaj DWA zadania:\n"
@@ -481,47 +557,40 @@ async def ocr_call_gemini(
             'Odpowiedz WYLACZNIE JSON: {"text": "wyekstrahowany tekst..."}'
         )
 
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(
-            api_url,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key_val}",
-            },
-            json={
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": "Przeanalizuj te strone dokumentu:"},
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}},
-                        ],
-                    },
-                ],
-                "max_tokens": 8000,
-                "temperature": 0,
-            },
-        )
-        resp.raise_for_status()
-        result = resp.json()
-        content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Przeanalizuj te strone dokumentu:"},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}},
+            ],
+        },
+    ]
 
-        # Attempt to parse JSON response; fall back to raw text
-        try:
-            cleaned = content.strip()
-            if cleaned.startswith("```json"):
-                cleaned = cleaned[7:]
-            if cleaned.startswith("```"):
-                cleaned = cleaned[3:]
-            if cleaned.endswith("```"):
-                cleaned = cleaned[:-3]
-            parsed = json.loads(cleaned.strip())
-            return parsed
-        except json.JSONDecodeError:
-            return {"text": content, "images": []}
+    result = await _call_vision_with_fallback(
+        messages=messages,
+        max_tokens=8000,
+        temperature=0,
+        force_qwen=(anonymize and bool(qwen_api_key)),
+        qwen_api_key=qwen_api_key,
+    )
 
+    content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+    # Attempt to parse JSON response; fall back to raw text
+    try:
+        cleaned = content.strip()
+        if cleaned.startswith("```json"):
+            cleaned = cleaned[7:]
+        if cleaned.startswith("```"):
+            cleaned = cleaned[3:]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+        parsed = json.loads(cleaned.strip())
+        return parsed
+    except json.JSONDecodeError:
+        return {"text": content, "images": []}
 
 async def describe_epub_image(
     image_base64: str,
@@ -529,13 +598,10 @@ async def describe_epub_image(
     mime_type: str = "image/jpeg",
 ) -> Dict[str, str]:
     """
-    Call Gemini Vision API to describe a single image extracted from an EPUB.
+    Call Vision API to describe a single image extracted from an EPUB.
     Returns {"type": "...", "description": "..."}.
-    Unlike OCR pages, we only need the image description — no text extraction.
+    Uses Gemini → OpenAI fallback chain.
     """
-    if not GEMINI_API_KEY:
-        raise ValueError("GEMINI_API_KEY is not configured — set it in environment variables")
-
     system_prompt = (
         "Jestes ekspertem od analizy obrazow w dokumentach. "
         "Opisz dokladnie co przedstawia ten obraz.\n\n"
@@ -551,49 +617,40 @@ async def describe_epub_image(
         '{"type": "photo|chart|diagram|table|schema|logo|illustration|other", "description": "..."}'
     )
 
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(
-            GEMINI_API_URL,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {GEMINI_API_KEY}",
-            },
-            json={
-                "model": GEMINI_MODEL,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": "Opisz ten obraz z dokumentu EPUB:"},
-                            {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_base64}"}},
-                        ],
-                    },
-                ],
-                "max_tokens": 2000,
-                "temperature": 0,
-            },
-        )
-        resp.raise_for_status()
-        result = resp.json()
-        content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Opisz ten obraz z dokumentu EPUB:"},
+                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_base64}"}},
+            ],
+        },
+    ]
 
-        try:
-            cleaned = content.strip()
-            if cleaned.startswith("```json"):
-                cleaned = cleaned[7:]
-            if cleaned.startswith("```"):
-                cleaned = cleaned[3:]
-            if cleaned.endswith("```"):
-                cleaned = cleaned[:-3]
-            parsed = json.loads(cleaned.strip())
-            return {
-                "type": parsed.get("type", "unknown"),
-                "description": parsed.get("description", ""),
-            }
-        except json.JSONDecodeError:
-            return {"type": "unknown", "description": content}
+    result = await _call_vision_with_fallback(
+        messages=messages,
+        max_tokens=2000,
+        temperature=0,
+    )
 
+    content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+    try:
+        cleaned = content.strip()
+        if cleaned.startswith("```json"):
+            cleaned = cleaned[7:]
+        if cleaned.startswith("```"):
+            cleaned = cleaned[3:]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+        parsed = json.loads(cleaned.strip())
+        return {
+            "type": parsed.get("type", "unknown"),
+            "description": parsed.get("description", ""),
+        }
+    except json.JSONDecodeError:
+        return {"type": "unknown", "description": content}
 
 async def _describe_image_with_retry(
     img_b64: str,
@@ -605,22 +662,16 @@ async def _describe_image_with_retry(
     for attempt in range(3):
         try:
             return await describe_epub_image(img_b64, image_desc_tokens, mime_type)
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 429:
-                wait = 10 * (attempt + 1)
-                print(f"[epub-worker] Rate limited on image {img_idx}, retrying in {wait}s...")
-                await asyncio.sleep(wait)
-            else:
-                raise
         except Exception as exc:
             if attempt < 2:
-                await asyncio.sleep(5)
+                wait = 5 * (attempt + 1)
+                print(f"[epub-worker] Image {img_idx} attempt {attempt + 1} failed: {exc}, retrying in {wait}s...")
+                await asyncio.sleep(wait)
             else:
                 print(f"[epub-worker] Image {img_idx} description failed after 3 attempts: {exc}")
                 return {"type": "unknown", "description": f"[DESCRIPTION ERROR: {exc}]"}
 
     return {"type": "unknown", "description": "[DESCRIPTION ERROR]"}
-
 
 async def update_heartbeat(
     supabase_url: str,
@@ -668,7 +719,6 @@ async def update_heartbeat(
             return rows[0].get("status", "processing")
         return "processing"
 
-
 async def _get_tenant_slug(job: OcrJobRequest) -> Optional[str]:
     """Resolve tenant_id to slug via Supabase REST."""
     try:
@@ -686,7 +736,6 @@ async def _get_tenant_slug(job: OcrJobRequest) -> Optional[str]:
     except Exception as e:
         print(f"[ocr-worker] Failed to get tenant slug: {e}")
     return None
-
 
 async def _ocr_page_with_retry(
     img_b64: str,
@@ -706,22 +755,16 @@ async def _ocr_page_with_retry(
                 extract_images=extract_images,
                 image_desc_tokens=image_desc_tokens,
             )
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 429:
-                wait = 10 * (attempt + 1)
-                print(f"[ocr-worker] Rate limited on page {page_num}, retrying in {wait}s...")
-                await asyncio.sleep(wait)
-            else:
-                raise
         except Exception as exc:
             if attempt < 2:
-                await asyncio.sleep(5)
+                wait = 5 * (attempt + 1)
+                print(f"[ocr-worker] Page {page_num} attempt {attempt + 1} failed: {exc}, retrying in {wait}s...")
+                await asyncio.sleep(wait)
             else:
                 print(f"[ocr-worker] Page {page_num} failed after 3 attempts: {exc}")
                 return {"text": f"[OCR ERROR: {exc}]", "images": []}
 
     return {"text": "[OCR ERROR]", "images": []}
-
 
 async def ocr_worker_process(job: OcrJobRequest):
     """
@@ -770,29 +813,21 @@ async def ocr_worker_process(job: OcrJobRequest):
 
         print(f"[ocr-worker] Starting job {job_id}: {job.file_name}")
 
-        # Obtain the running event loop once; reused for all executor calls below.
-        # get_running_loop() is preferred over get_event_loop() in Python 3.10+:
-        # it raises RuntimeError immediately if called outside a coroutine instead
-        # of silently creating a new loop that would never be awaited.
         loop = asyncio.get_running_loop()
 
         # ── Step 1: Write PDF to disk ──────────────────────────────────────────
-        # Use a unique temp path so concurrent jobs never collide.
         tmp_path = f"/tmp/ocr_{job_id}_{uuid.uuid4().hex}.pdf"
 
         if job.file_download_url:
-            # Try to resolve the URL to a local file path first (zero I/O overhead)
             local_path = _resolve_local_path(job.file_download_url)
             if local_path:
                 print(f"[ocr-worker] Local file found → copying {local_path} → {tmp_path}")
                 shutil.copy2(str(local_path), tmp_path)
             else:
-                # Rewrite self-referencing URLs to localhost to avoid external DNS/ingress
                 actual_url = _rewrite_to_localhost(job.file_download_url)
                 if actual_url != job.file_download_url:
                     print(f"[ocr-worker] Rewritten URL: {job.file_download_url} → {actual_url}")
 
-                # Stream directly to disk — avoids holding the full body in RAM
                 print(f"[ocr-worker] Streaming download → {tmp_path}")
                 async with httpx.AsyncClient(timeout=300) as client:
                     async with client.stream("GET", actual_url, headers={
@@ -804,12 +839,11 @@ async def ocr_worker_process(job: OcrJobRequest):
                                 fh.write(chunk)
 
         elif job.file_base64:
-            # Decode base64 payload and immediately flush to disk
             print(f"[ocr-worker] Decoding base64 → {tmp_path}")
             pdf_bytes = base64.b64decode(job.file_base64)
             with open(tmp_path, "wb") as fh:
                 fh.write(pdf_bytes)
-            del pdf_bytes  # release RAM before rasterisation begins
+            del pdf_bytes
 
         else:
             raise ValueError("No file source provided (file_download_url or file_base64 required)")
@@ -818,8 +852,6 @@ async def ocr_worker_process(job: OcrJobRequest):
         print(f"[ocr-worker] PDF on disk: {file_size_mb:.1f} MB → {tmp_path}")
 
         # ── Step 2: Determine page count without loading any images ───────────
-        # pdfinfo_from_path calls a poppler subprocess — run in executor so it
-        # does not block the event loop while other jobs are awaiting I/O.
         info = await loop.run_in_executor(
             None,
             functools.partial(pdfinfo_from_path, tmp_path),
@@ -829,9 +861,6 @@ async def ocr_worker_process(job: OcrJobRequest):
         print(f"[ocr-worker] Total pages: {total_pages}")
 
         # ── Step 3: Prepare incremental JSONL output files on disk ────────────
-        # Writing results page-by-page to disk avoids accumulating thousands of
-        # page strings in RAM (e.g. 1200 pages × ~5 KB text ≈ 6 MB — manageable,
-        # but _ocr_images with base64 thumbnails could grow to hundreds of MB).
         tenant_slug = await _get_tenant_slug(job)
         if not tenant_slug:
             raise ValueError("Could not resolve tenant slug")
@@ -842,7 +871,6 @@ async def ocr_worker_process(job: OcrJobRequest):
         texts_jsonl = ocr_dir / "_ocr_texts.jsonl"
         images_jsonl = ocr_dir / "_ocr_images.jsonl"
 
-        # Clear any leftover results from a previous failed run
         for f in [texts_jsonl, images_jsonl]:
             if f.exists():
                 f.unlink()
@@ -851,7 +879,6 @@ async def ocr_worker_process(job: OcrJobRequest):
         image_desc_tokens = job.settings.get("imageDescTokens", 200)
         pages_done = 0
 
-        # Directory for cropped image files (individual images detected by Gemini)
         pages_dir = ocr_dir / "_images"
         if extract_images:
             pages_dir.mkdir(parents=True, exist_ok=True)
@@ -860,7 +887,6 @@ async def ocr_worker_process(job: OcrJobRequest):
         for chunk_start_0 in range(0, total_pages, PDF_CHUNK_SIZE):
             chunk_end_0 = min(chunk_start_0 + PDF_CHUNK_SIZE, total_pages)
 
-            # pdf2image uses 1-based page numbering
             first_page = chunk_start_0 + 1
             last_page = chunk_end_0
 
@@ -869,12 +895,6 @@ async def ocr_worker_process(job: OcrJobRequest):
                 f"of {total_pages} (DPI={PDF_DPI})..."
             )
 
-            # convert_from_path calls pdftoppm (synchronous subprocess).
-            # Running it in the thread-pool executor yields control back to the
-            # event loop so that other coroutines (e.g. OCR API calls from a
-            # concurrent job) can continue while poppler renders this chunk.
-            # functools.partial avoids the PyCharm "Parameter 'args' unfilled"
-            # false-positive that appears when a lambda is passed to run_in_executor.
             chunk_images = await loop.run_in_executor(
                 None,
                 functools.partial(
@@ -887,11 +907,9 @@ async def ocr_worker_process(job: OcrJobRequest):
                 ),
             )
 
-            # OCR this chunk in small concurrent batches
             for batch_start in range(0, len(chunk_images), OCR_PAGE_CONCURRENCY):
                 batch_end = min(batch_start + OCR_PAGE_CONCURRENCY, len(chunk_images))
 
-                # Periodic heartbeat to DB — also checks for cancellation
                 if pages_done > 0 and pages_done % OCR_HEARTBEAT_INTERVAL == 0:
                     try:
                         status = await update_heartbeat(
@@ -913,7 +931,7 @@ async def ocr_worker_process(job: OcrJobRequest):
 
                 async def process_page(local_idx: int) -> Dict:
                     """Encode one PIL Image to JPEG/base64, OCR it, crop detected images."""
-                    global_page_num = chunk_start_0 + local_idx + 1  # 1-based
+                    global_page_num = chunk_start_0 + local_idx + 1
                     img = chunk_images[local_idx]
                     img_width, img_height = img.size
 
@@ -928,7 +946,6 @@ async def ocr_worker_process(job: OcrJobRequest):
                         img_b64, job, extract_images, image_desc_tokens, global_page_num,
                     )
 
-                    # Crop and save detected images based on bounding boxes
                     cropped_images = []
                     for img_idx, img_info in enumerate(result.get("images", [])):
                         bbox = img_info.get("bbox")
@@ -937,10 +954,8 @@ async def ocr_worker_process(job: OcrJobRequest):
                             continue
 
                         try:
-                            # Gemini bbox: [y_min, x_min, y_max, x_max] in 0-1000 scale
                             y_min, x_min, y_max, x_max = bbox
 
-                            # Add 3% padding to avoid cutting edges
                             pad_x = int((x_max - x_min) * 0.03)
                             pad_y = int((y_max - y_min) * 0.03)
                             x_min = max(0, x_min - pad_x)
@@ -948,13 +963,11 @@ async def ocr_worker_process(job: OcrJobRequest):
                             x_max = min(1000, x_max + pad_x)
                             y_max = min(1000, y_max + pad_y)
 
-                            # Convert from 0-1000 scale to pixel coordinates
                             left = int(x_min / 1000 * img_width)
                             upper = int(y_min / 1000 * img_height)
                             right = int(x_max / 1000 * img_width)
                             lower = int(y_max / 1000 * img_height)
 
-                            # Validate crop area (min 20x20 pixels)
                             if (right - left) < 20 or (lower - upper) < 20:
                                 print(f"[ocr-worker] Page {global_page_num} img {img_idx}: bbox too small, skipping crop")
                                 cropped_images.append(None)
@@ -984,13 +997,11 @@ async def ocr_worker_process(job: OcrJobRequest):
                     cropped = r.get("cropped_images", [])
                     pages_done += 1
 
-                    # Write text result immediately to JSONL — no in-memory accumulation
                     with open(texts_jsonl, "a", encoding="utf-8") as fh:
                         fh.write(
                             json.dumps({"page": page_num, "text": text}, ensure_ascii=False) + "\n"
                         )
 
-                    # Write detected image metadata to separate JSONL
                     for img_idx, img_info in enumerate(r["result"].get("images", [])):
                         crop_filename = cropped[img_idx] if img_idx < len(cropped) else None
                         img_entry = {
@@ -1015,12 +1026,9 @@ async def ocr_worker_process(job: OcrJobRequest):
                 ocr_jobs[job_id]["pages_done"] = pages_done
                 print(f"[ocr-worker] Progress: {pages_done}/{total_pages} pages")
 
-                # Small back-off between OCR batches to respect API rate limits
                 if batch_end < len(chunk_images):
                     await asyncio.sleep(0.5)
 
-            # Free this chunk's PIL Images before rasterising the next chunk —
-            # this is the critical step that keeps RAM bounded.
             del chunk_images
 
         # ── Step 5: Assemble final result from JSONL files ────────────────────
@@ -1032,7 +1040,6 @@ async def ocr_worker_process(job: OcrJobRequest):
                 entry = json.loads(line)
                 page_texts[entry["page"]] = entry["text"]
 
-        # Join pages in correct order
         sorted_texts = [page_texts.get(p, "") for p in sorted(page_texts.keys())]
         full_text = "\n\n---\n\n".join(t for t in sorted_texts if t)
 
@@ -1047,13 +1054,11 @@ async def ocr_worker_process(job: OcrJobRequest):
             f"{len(all_images)} images from {total_pages} pages"
         )
 
-        # Count saved cropped images
         cropped_count = 0
         if extract_images and pages_dir.exists():
             cropped_count = len(list(pages_dir.glob("page_*_img_*.jpg")))
             print(f"[ocr-worker] Saved {cropped_count} cropped images to {pages_dir}")
 
-        # Save assembled result to persistent file storage
         ocr_result_file = ocr_dir / "_ocr_result.json"
         with open(ocr_result_file, "w", encoding="utf-8") as fh:
             json.dump(
@@ -1070,14 +1075,10 @@ async def ocr_worker_process(job: OcrJobRequest):
         result_size_mb = ocr_result_file.stat().st_size / 1024 / 1024
         print(f"[ocr-worker] OCR result saved: {ocr_result_file} ({result_size_mb:.1f} MB)")
 
-        # Clean up JSONL working files
         texts_jsonl.unlink(missing_ok=True)
         images_jsonl.unlink(missing_ok=True)
 
         # ── Step 6: Lightweight callback — URL reference only ─────────────────
-        # Sending the full document text in the callback body caused Edge Function
-        # WORKER_LIMIT errors for large documents. Instead we pass a URL that the
-        # pipeline can fetch directly from file-receiver storage.
         file_receiver_base = os.getenv("FILE_RECEIVER_URL", "https://file-receiver.agentic.pl").rstrip("/")
         ocr_result_url = (
             f"{file_receiver_base}/files/{tenant_slug}/"
@@ -1098,8 +1099,6 @@ async def ocr_worker_process(job: OcrJobRequest):
             "file_source_type": job.file_source_type,
             "file_user_id": job.file_user_id,
             "auth_token": job.auth_token,
-            # Pipeline fetches the full result from this URL instead of receiving
-            # it inline — avoids Supabase Edge Function body size limits
             "_ocr_result_url": ocr_result_url,
             "_ocr_page_count": total_pages,
         }
@@ -1189,7 +1188,6 @@ async def ocr_worker_process(job: OcrJobRequest):
 
                             remaining = sum(1 for f in pf if f.get("status") == "pending")
                             if remaining > 0:
-                                # Trigger worker for the next pending file
                                 await client.post(
                                     f"{job.supabase_url}/functions/v1/ingest-worker",
                                     headers={
@@ -1204,7 +1202,6 @@ async def ocr_worker_process(job: OcrJobRequest):
                                     },
                                 )
                             else:
-                                # All files processed — set final ingestion status
                                 final_status = "failed" if ec == len(pf) else "completed"
                                 await client.post(
                                     f"{job.supabase_url}/rest/v1/rpc/execute_tenant_query",
@@ -1226,9 +1223,6 @@ async def ocr_worker_process(job: OcrJobRequest):
             print(f"[ocr-worker] Error updating DB on failure: {db_err}")
 
     finally:
-        # Always remove the temp PDF file — this runs even if the job was
-        # cancelled, raised an unhandled exception, or returned early.
-        # Without this, a 500 MB file would linger in /tmp after every failure.
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.unlink(tmp_path)
@@ -1236,9 +1230,7 @@ async def ocr_worker_process(job: OcrJobRequest):
             except Exception as cleanup_err:
                 print(f"[ocr-worker] Failed to remove temp file {tmp_path}: {cleanup_err}")
 
-
 # ── Endpoints ──────────────────────────────────────────────────
-
 
 @app.get("/health")
 async def health():
@@ -1263,9 +1255,7 @@ async def health():
         "timestamp": datetime.utcnow().isoformat() + "Z",
     }
 
-
 # ── OCR Worker endpoints ──────────────────────────────────────
-
 
 @app.post("/ocr-job")
 async def submit_ocr_job(
@@ -1304,7 +1294,6 @@ async def submit_ocr_job(
         "status": "accepted",
     })
 
-
 @app.get("/ocr-job/{ingestion_id}/{file_index}")
 async def get_ocr_job_status(
     ingestion_id: str,
@@ -1320,7 +1309,6 @@ async def get_ocr_job_status(
 
     return ocr_jobs[job_id]
 
-
 @app.get("/ocr-jobs")
 async def list_ocr_jobs(x_api_key: str = Header(...)):
     """List all OCR jobs."""
@@ -1331,9 +1319,7 @@ async def list_ocr_jobs(x_api_key: str = Header(...)):
         "active": sum(1 for j in ocr_jobs.values() if j["status"] == "processing"),
     }
 
-
 # ── Upload ─────────────────────────────────────────────────────
-
 
 @app.post("/upload/{tenant_slug}/{kb_id}/{doc_id}")
 async def upload_file(
@@ -1383,7 +1369,6 @@ async def upload_file(
         "source": source,
     })
 
-
 @app.post("/files/upload")
 async def upload_file_legacy(
     file: UploadFile = File(...),
@@ -1426,7 +1411,6 @@ async def upload_file_legacy(
         "source": source,
     })
 
-
 @app.get("/files/{tenant_slug}/{kb_id}/{doc_id}/{filename:path}")
 async def download_file(
     tenant_slug: str,
@@ -1449,21 +1433,17 @@ async def download_file(
     if not str(file_path.resolve()).startswith(str(Path(STORAGE_ROOT).resolve())):
         raise HTTPException(status_code=403, detail="Access denied")
 
-    # Use only the basename for Content-Disposition (not the subpath)
     display_name = Path(filename).name
     ext = file_path.suffix.lower()
     media_type = MIME_MAP.get(ext, "application/octet-stream")
     disposition = "attachment" if download else "inline"
 
-    # RFC 5987: use ASCII fallback + UTF-8 encoded filename to avoid
-    # latin-1 encoding errors with non-ASCII characters (e.g. Polish ń, ó)
     ascii_filename = display_name.encode("ascii", "ignore").decode("ascii").strip() or "download"
     utf8_filename = urllib.parse.quote(display_name)
 
     return FileResponse(
         path=str(file_path),
         media_type=media_type,
-        # Do not pass filename= to FileResponse — we set Content-Disposition manually
         headers={
             "Content-Disposition": (
                 f'{disposition}; filename="{ascii_filename}"; '
@@ -1471,7 +1451,6 @@ async def download_file(
             )
         },
     )
-
 
 @app.get("/files/{tenant_slug}/{kb_id}/{doc_id}")
 async def list_doc_files(
@@ -1507,7 +1486,6 @@ async def list_doc_files(
         "total": len(files),
     }
 
-
 @app.get("/files/{tenant_slug}/{kb_id}")
 async def list_kb_documents(
     tenant_slug: str,
@@ -1542,7 +1520,6 @@ async def list_kb_documents(
         "total": len(documents),
     }
 
-
 @app.delete("/files/{tenant_slug}/{kb_id}/{doc_id}")
 async def delete_document(
     tenant_slug: str,
@@ -1565,7 +1542,6 @@ async def delete_document(
     shutil.rmtree(doc_path)
 
     return {"deleted": True, "doc_id": doc_id}
-
 
 @app.delete("/files/{tenant_slug}/{kb_id}/{doc_id}/{filename:path}")
 async def delete_single_file(
@@ -1590,7 +1566,6 @@ async def delete_single_file(
     file_path.unlink()
 
     return {"deleted": True, "filename": filename, "doc_id": doc_id}
-
 
 @app.get("/files/{tenant_slug}")
 async def list_tenant_kbs(
@@ -1633,7 +1608,6 @@ async def list_tenant_kbs(
         "total": len(kbs),
     }
 
-
 @app.get("/tenants/{tenant_slug}/stats")
 async def tenant_stats(tenant_slug: str, x_api_key: str = Header(...)):
     """Get storage statistics for a tenant."""
@@ -1673,9 +1647,7 @@ async def tenant_stats(tenant_slug: str, x_api_key: str = Header(...)):
         "total_bytes": total_bytes,
     }
 
-
 # ── PDF to images ─────────────────────────────────────────────
-
 
 @app.post("/pdf-to-images")
 async def pdf_to_images(req: PdfToImagesRequest, x_api_key: str = Header(...)):
@@ -1727,7 +1699,6 @@ async def pdf_to_images(req: PdfToImagesRequest, x_api_key: str = Header(...)):
         "dpi": req.dpi,
     }
 
-
 # ── EPUB extraction (Background Worker) ───────────────────────
 
 EPUB_IMAGE_MIME = {
@@ -1740,7 +1711,6 @@ EPUB_IMAGE_MIME = {
     ".tiff": "image/tiff",
 }
 
-
 async def epub_worker_process(job: EpubExtractRequest):
     """
     Background task: Extract text and images from an EPUB file.
@@ -1748,7 +1718,7 @@ async def epub_worker_process(job: EpubExtractRequest):
     1. Download/decode EPUB to bytes
     2. Parse ZIP → extract text (HTMLParser) and raw images
     3. Save images to disk
-    4. Send each image to Gemini for description (with concurrency + retries)
+    4. Send each image to Gemini/OpenAI for description (with concurrency + retries)
     5. Save _epub_result.json to disk
     6. Lightweight callback with URL reference (like OCR worker)
     """
@@ -1796,7 +1766,7 @@ async def epub_worker_process(job: EpubExtractRequest):
         epub_jobs[job_id]["total_images"] = total_images
         print(f"[epub-worker] Parsed: {len(text)} chars, {chapter_count} chapters, {total_images} images")
 
-        # ── Step 3: Save images to disk + describe with Gemini ─────────────
+        # ── Step 3: Save images to disk + describe with AI ─────────────────
         file_receiver_base = os.getenv(
             "FILE_RECEIVER_URL", "https://file-receiver.agentic.pl"
         ).rstrip("/")
@@ -1831,7 +1801,7 @@ async def epub_worker_process(job: EpubExtractRequest):
                 except Exception as save_err:
                     print(f"[epub-worker] Failed to save image {img_filename}: {save_err}")
 
-                # Describe with Gemini
+                # Describe with AI (Gemini → OpenAI fallback)
                 img_b64 = base64.b64encode(raw_bytes).decode("ascii")
                 desc = await _describe_image_with_retry(
                     img_b64, image_desc_tokens, mime_type, idx,
@@ -2038,7 +2008,6 @@ async def epub_worker_process(job: EpubExtractRequest):
         except Exception as db_err:
             print(f"[epub-worker] Error updating DB on failure: {db_err}")
 
-
 @app.post("/extract-epub")
 async def submit_epub_job(
     req: EpubExtractRequest,
@@ -2047,7 +2016,7 @@ async def submit_epub_job(
 ):
     """
     Submit an EPUB file for background extraction.
-    The worker extracts text and images, describes each image with Gemini,
+    The worker extracts text and images, describes each image with AI,
     saves results to disk, and calls back the pipeline when done.
     """
     verify_api_key(x_api_key)
@@ -2069,7 +2038,6 @@ async def submit_epub_job(
         "status": "accepted",
     })
 
-
 @app.get("/epub-job/{ingestion_id}/{file_index}")
 async def get_epub_job_status(
     ingestion_id: str,
@@ -2084,7 +2052,6 @@ async def get_epub_job_status(
         raise HTTPException(status_code=404, detail="Job not found")
 
     return epub_jobs[job_id]
-
 
 @app.get("/epub-jobs")
 async def list_epub_jobs(x_api_key: str = Header(...)):
