@@ -61,10 +61,13 @@ OCR_HEARTBEAT_INTERVAL = int(os.getenv("OCR_HEARTBEAT_INTERVAL", "10"))  # pages
 # Active OCR jobs tracking (in-memory)
 ocr_jobs: Dict[str, Dict[str, Any]] = {}
 
+# Active EPUB extraction jobs tracking (in-memory)
+epub_jobs: Dict[str, Dict[str, Any]] = {}
+
 app = FastAPI(
     title="BlueBox File Receiver",
-    version="4.5.0",
-    description="Tenant-isolated file storage + PDF-to-images + EPUB extraction + Background OCR Worker",
+    version="4.6.0",
+    description="Tenant-isolated file storage + PDF-to-images + Background OCR Worker + Background EPUB extraction",
 )
 
 
@@ -120,14 +123,36 @@ class OcrJobRequest(BaseModel):
 
 
 class EpubExtractRequest(BaseModel):
-    """Request body for extracting text from an EPUB file."""
+    """Request body for submitting an EPUB extraction job."""
+    # Source
     file_download_url: Optional[str] = None
     file_base64: Optional[str] = None
     file_name: str = "book.epub"
-    # Context for saving extracted images to disk
-    tenant_slug: str
+
+    # DB context for progress updates and callback
+    tenant_id: str
+    ingestion_id: str
+    file_index: int
+    file_id: str
     knowledge_base_id: str
+    tenant_slug: str
     doc_id: str
+    file_path: Optional[str] = None
+    file_source_type: Optional[str] = None
+    file_user_id: Optional[str] = None
+
+    # Processing settings
+    settings: Dict[str, Any] = {}
+    image_desc_tokens: int = 200
+
+    # Auth
+    supabase_url: str
+    supabase_service_role_key: str
+    supabase_anon_key: str
+    auth_token: Optional[str] = None
+
+    # Callback: pipeline URL to call when extraction is done
+    callback_url: str
 
 
 # ── EPUB helpers ───────────────────────────────────────────────
@@ -496,6 +521,105 @@ async def ocr_call_gemini(
             return parsed
         except json.JSONDecodeError:
             return {"text": content, "images": []}
+
+
+async def describe_epub_image(
+    image_base64: str,
+    image_desc_tokens: int = 200,
+    mime_type: str = "image/jpeg",
+) -> Dict[str, str]:
+    """
+    Call Gemini Vision API to describe a single image extracted from an EPUB.
+    Returns {"type": "...", "description": "..."}.
+    Unlike OCR pages, we only need the image description — no text extraction.
+    """
+    if not GEMINI_API_KEY:
+        raise ValueError("GEMINI_API_KEY is not configured — set it in environment variables")
+
+    system_prompt = (
+        "Jestes ekspertem od analizy obrazow w dokumentach. "
+        "Opisz dokladnie co przedstawia ten obraz.\n\n"
+
+        "Jesli obraz zawiera tabele:\n"
+        "- Jezeli cala tabela mozna przepisac w limicie tokenow, przepisz jej zawartosc w formacie Markdown.\n"
+        "- Jezeli tabela jest zbyt duza i przepisanie jej przekroczyloby limit tokenow, NIE przepisuj jej. "
+        "Zamiast tego opisz jej strukture, glowne kolumny, typ danych oraz kontekst.\n\n"
+
+        "Jesli to wykres, diagram, schemat lub zdjecie — opisz jego zawartosc i kontekst.\n\n"
+
+        f"Odpowiedz WYLACZNIE JSON (maksymalnie {image_desc_tokens} tokenow opisu):\n"
+        '{"type": "photo|chart|diagram|table|schema|logo|illustration|other", "description": "..."}'
+    )
+
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.post(
+            GEMINI_API_URL,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {GEMINI_API_KEY}",
+            },
+            json={
+                "model": GEMINI_MODEL,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Opisz ten obraz z dokumentu EPUB:"},
+                            {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_base64}"}},
+                        ],
+                    },
+                ],
+                "max_tokens": 2000,
+                "temperature": 0,
+            },
+        )
+        resp.raise_for_status()
+        result = resp.json()
+        content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+        try:
+            cleaned = content.strip()
+            if cleaned.startswith("```json"):
+                cleaned = cleaned[7:]
+            if cleaned.startswith("```"):
+                cleaned = cleaned[3:]
+            if cleaned.endswith("```"):
+                cleaned = cleaned[:-3]
+            parsed = json.loads(cleaned.strip())
+            return {
+                "type": parsed.get("type", "unknown"),
+                "description": parsed.get("description", ""),
+            }
+        except json.JSONDecodeError:
+            return {"type": "unknown", "description": content}
+
+
+async def _describe_image_with_retry(
+    img_b64: str,
+    image_desc_tokens: int,
+    mime_type: str,
+    img_idx: int,
+) -> Dict[str, str]:
+    """Describe a single image with up to 3 retries and rate-limit back-off."""
+    for attempt in range(3):
+        try:
+            return await describe_epub_image(img_b64, image_desc_tokens, mime_type)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429:
+                wait = 10 * (attempt + 1)
+                print(f"[epub-worker] Rate limited on image {img_idx}, retrying in {wait}s...")
+                await asyncio.sleep(wait)
+            else:
+                raise
+        except Exception as exc:
+            if attempt < 2:
+                await asyncio.sleep(5)
+            else:
+                print(f"[epub-worker] Image {img_idx} description failed after 3 attempts: {exc}")
+                return {"type": "unknown", "description": f"[DESCRIPTION ERROR: {exc}]"}
+
+    return {"type": "unknown", "description": "[DESCRIPTION ERROR]"}
 
 
 async def update_heartbeat(
@@ -1126,6 +1250,7 @@ async def health():
     tenant_count = sum(1 for d in root.iterdir() if d.is_dir()) if root.exists() else 0
 
     active_jobs = sum(1 for j in ocr_jobs.values() if j["status"] == "processing")
+    active_epub = sum(1 for j in epub_jobs.values() if j["status"] == "processing")
 
     return {
         "status": "ok" if storage_ok else "degraded",
@@ -1134,6 +1259,7 @@ async def health():
         "poppler_available": poppler_ok,
         "tenant_count": tenant_count,
         "active_ocr_jobs": active_jobs,
+        "active_epub_jobs": active_epub,
         "timestamp": datetime.utcnow().isoformat() + "Z",
     }
 
@@ -1602,111 +1728,370 @@ async def pdf_to_images(req: PdfToImagesRequest, x_api_key: str = Header(...)):
     }
 
 
-# ── EPUB extraction ───────────────────────────────────────────
+# ── EPUB extraction (Background Worker) ───────────────────────
+
+EPUB_IMAGE_MIME = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+    ".tiff": "image/tiff",
+}
+
+
+async def epub_worker_process(job: EpubExtractRequest):
+    """
+    Background task: Extract text and images from an EPUB file.
+
+    1. Download/decode EPUB to bytes
+    2. Parse ZIP → extract text (HTMLParser) and raw images
+    3. Save images to disk
+    4. Send each image to Gemini for description (with concurrency + retries)
+    5. Save _epub_result.json to disk
+    6. Lightweight callback with URL reference (like OCR worker)
+    """
+    job_id = f"{job.ingestion_id}_{job.file_index}"
+    epub_jobs[job_id] = {
+        "status": "processing",
+        "images_done": 0,
+        "total_images": 0,
+        "started_at": datetime.utcnow().isoformat(),
+        "error": None,
+    }
+
+    try:
+        print(f"[epub-worker] Starting job {job_id}: {job.file_name}")
+
+        # ── Step 1: Get EPUB bytes ─────────────────────────────────────────
+        epub_bytes: Optional[bytes] = None
+
+        if job.file_download_url:
+            local_path = _resolve_local_path(job.file_download_url)
+            if local_path:
+                print(f"[epub-worker] Local file found: {local_path}")
+                epub_bytes = local_path.read_bytes()
+            else:
+                actual_url = _rewrite_to_localhost(job.file_download_url)
+                if actual_url != job.file_download_url:
+                    print(f"[epub-worker] Rewritten URL: {job.file_download_url} → {actual_url}")
+                print(f"[epub-worker] Downloading: {actual_url}")
+                async with httpx.AsyncClient(timeout=120) as client:
+                    resp = await client.get(actual_url, headers={"X-Api-Key": API_KEY})
+                    resp.raise_for_status()
+                    epub_bytes = resp.content
+        elif job.file_base64:
+            epub_bytes = base64.b64decode(job.file_base64)
+        else:
+            raise ValueError("No file source provided (file_download_url or file_base64 required)")
+
+        print(f"[epub-worker] EPUB size: {len(epub_bytes) / 1024:.1f} KB")
+
+        # ── Step 2: Parse EPUB ─────────────────────────────────────────────
+        text, chapter_count, extracted_images = _parse_epub_bytes(epub_bytes)
+        del epub_bytes  # free RAM
+
+        total_images = len(extracted_images)
+        epub_jobs[job_id]["total_images"] = total_images
+        print(f"[epub-worker] Parsed: {len(text)} chars, {chapter_count} chapters, {total_images} images")
+
+        # ── Step 3: Save images to disk + describe with Gemini ─────────────
+        file_receiver_base = os.getenv(
+            "FILE_RECEIVER_URL", "https://file-receiver.agentic.pl"
+        ).rstrip("/")
+        doc_path = get_doc_path(job.tenant_slug, job.knowledge_base_id, job.doc_id)
+        images_jsonl = doc_path / "_epub_images.jsonl"
+        if images_jsonl.exists():
+            images_jsonl.unlink()
+
+        image_desc_tokens = job.image_desc_tokens
+        images_done = 0
+
+        for batch_start in range(0, total_images, OCR_PAGE_CONCURRENCY):
+            batch_end = min(batch_start + OCR_PAGE_CONCURRENCY, total_images)
+
+            async def process_image(idx: int) -> dict:
+                img = extracted_images[idx]
+                raw_bytes = img["raw_bytes"]
+                ext = img.get("ext", ".jpg")
+                alt = img.get("alt", "")
+                img_filename = f"epub_image_{idx}{ext}"
+                mime_type = EPUB_IMAGE_MIME.get(ext, "image/jpeg")
+
+                # Save image file to disk
+                img_url = None
+                img_path = doc_path / img_filename
+                try:
+                    img_path.write_bytes(raw_bytes)
+                    img_url = (
+                        f"{file_receiver_base}/files/{job.tenant_slug}/"
+                        f"{job.knowledge_base_id}/{job.doc_id}/{img_filename}"
+                    )
+                except Exception as save_err:
+                    print(f"[epub-worker] Failed to save image {img_filename}: {save_err}")
+
+                # Describe with Gemini
+                img_b64 = base64.b64encode(raw_bytes).decode("ascii")
+                desc = await _describe_image_with_retry(
+                    img_b64, image_desc_tokens, mime_type, idx,
+                )
+
+                return {
+                    "idx": idx,
+                    "img_url": img_url,
+                    "description": desc,
+                    "alt": alt,
+                    "zip_path": img.get("zip_path", ""),
+                    "chapter_idx": img.get("chapter_idx", 0),
+                }
+
+            tasks = [process_image(i) for i in range(batch_start, batch_end)]
+            results = await asyncio.gather(*tasks)
+
+            for r in results:
+                images_done += 1
+                img_entry = {
+                    "description": (
+                        f"[Image: {r['description'].get('type', 'unknown')}, "
+                        f"chapter {r['chapter_idx']}] "
+                        f"{r['description'].get('description', r['alt'])}"
+                    ),
+                    "section_context": "",
+                    "page": r["chapter_idx"],
+                    "image_url": r["img_url"],
+                }
+                with open(images_jsonl, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(img_entry, ensure_ascii=False) + "\n")
+
+            epub_jobs[job_id]["images_done"] = images_done
+            print(f"[epub-worker] Image progress: {images_done}/{total_images}")
+
+            # Small back-off between batches to respect API rate limits
+            if batch_end < total_images:
+                await asyncio.sleep(0.5)
+
+        # ── Step 4: Assemble and save result ───────────────────────────────
+        all_images = []
+        if images_jsonl.exists():
+            with open(images_jsonl, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    all_images.append(json.loads(line))
+            images_jsonl.unlink(missing_ok=True)
+
+        result_file = doc_path / "_epub_result.json"
+        with open(result_file, "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "document_text": text,
+                    "_epub_images": all_images,
+                    "_epub_chapter_count": chapter_count,
+                    "_epub_image_count": len(all_images),
+                },
+                fh,
+                ensure_ascii=False,
+            )
+
+        result_size_mb = result_file.stat().st_size / 1024 / 1024
+        print(f"[epub-worker] Result saved: {result_file} ({result_size_mb:.1f} MB)")
+
+        # ── Step 5: Lightweight callback ───────────────────────────────────
+        epub_result_url = (
+            f"{file_receiver_base}/files/{job.tenant_slug}/"
+            f"{job.knowledge_base_id}/{job.doc_id}/_epub_result.json"
+            f"?download=true"
+        )
+
+        print(f"[epub-worker] Calling back pipeline at {job.callback_url}")
+        callback_body = {
+            "file_name": job.file_name,
+            "file_id": job.file_id,
+            "knowledge_base_id": job.knowledge_base_id,
+            "settings": job.settings,
+            "tenant_id": job.tenant_id,
+            "ingestion_id": job.ingestion_id,
+            "file_index": job.file_index,
+            "file_path": job.file_path,
+            "file_source_type": job.file_source_type,
+            "file_user_id": job.file_user_id,
+            "auth_token": job.auth_token,
+            "_epub_result_url": epub_result_url,
+            "_epub_chapter_count": chapter_count,
+        }
+
+        async with httpx.AsyncClient(timeout=300) as client:
+            resp = await client.post(
+                job.callback_url,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {job.auth_token or job.supabase_anon_key}",
+                    "apikey": job.supabase_anon_key,
+                },
+                json=callback_body,
+            )
+            if resp.status_code >= 400:
+                print(f"[epub-worker] Callback failed: {resp.status_code} {resp.text[:500]}")
+            else:
+                print(f"[epub-worker] Callback success: {resp.status_code}")
+
+        epub_jobs[job_id]["status"] = "completed"
+        epub_jobs[job_id]["images_done"] = total_images
+
+    except Exception as e:
+        error_msg = f"{type(e).__name__}: {str(e)}"
+        print(f"[epub-worker] Job {job_id} failed: {error_msg}")
+        print(traceback.format_exc())
+        epub_jobs[job_id]["status"] = "failed"
+        epub_jobs[job_id]["error"] = error_msg
+
+        # Best-effort: mark the file as errored in the DB and trigger next file
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(
+                    f"{job.supabase_url}/rest/v1/tenants?id=eq.{job.tenant_id}&select=slug",
+                    headers={
+                        "apikey": job.supabase_service_role_key,
+                        "Authorization": f"Bearer {job.supabase_service_role_key}",
+                    },
+                )
+                tenants = resp.json()
+                if tenants:
+                    slug = tenants[0]["slug"]
+                    schema = f"tenant_{slug}"
+
+                    resp2 = await client.post(
+                        f"{job.supabase_url}/rest/v1/rpc/execute_tenant_query",
+                        headers={
+                            "apikey": job.supabase_service_role_key,
+                            "Authorization": f"Bearer {job.supabase_service_role_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "p_query": (
+                                f"SELECT pending_files FROM {schema}.ingestions "
+                                f"WHERE id = '{job.ingestion_id}'"
+                            )
+                        },
+                    )
+                    rows = resp2.json()
+                    if isinstance(rows, list) and rows:
+                        pf = rows[0].get("pending_files", [])
+                        if job.file_index < len(pf):
+                            pf[job.file_index]["status"] = "error"
+                            pf[job.file_index]["error"] = error_msg[:500]
+                            pc = sum(1 for f in pf if f.get("status") == "done")
+                            ec = sum(1 for f in pf if f.get("status") == "error")
+                            pf_json = json.dumps(pf).replace("'", "''")
+
+                            await client.post(
+                                f"{job.supabase_url}/rest/v1/rpc/execute_tenant_query",
+                                headers={
+                                    "apikey": job.supabase_service_role_key,
+                                    "Authorization": f"Bearer {job.supabase_service_role_key}",
+                                    "Content-Type": "application/json",
+                                },
+                                json={
+                                    "p_query": (
+                                        f"UPDATE {schema}.ingestions "
+                                        f"SET pending_files = '{pf_json}'::jsonb, "
+                                        f"processed_count = {pc}, "
+                                        f"error_count = {ec}, "
+                                        f"updated_at = now() "
+                                        f"WHERE id = '{job.ingestion_id}' RETURNING id"
+                                    )
+                                },
+                            )
+
+                            remaining = sum(1 for f in pf if f.get("status") == "pending")
+                            if remaining > 0:
+                                await client.post(
+                                    f"{job.supabase_url}/functions/v1/ingest-worker",
+                                    headers={
+                                        "Content-Type": "application/json",
+                                        "Authorization": f"Bearer {job.supabase_anon_key}",
+                                        "apikey": job.supabase_anon_key,
+                                    },
+                                    json={
+                                        "ingestion_id": job.ingestion_id,
+                                        "tenant_id": job.tenant_id,
+                                        "auth_token": job.auth_token,
+                                    },
+                                )
+                            else:
+                                final_status = "failed" if ec == len(pf) else "completed"
+                                await client.post(
+                                    f"{job.supabase_url}/rest/v1/rpc/execute_tenant_query",
+                                    headers={
+                                        "apikey": job.supabase_service_role_key,
+                                        "Authorization": f"Bearer {job.supabase_service_role_key}",
+                                        "Content-Type": "application/json",
+                                    },
+                                    json={
+                                        "p_query": (
+                                            f"UPDATE {schema}.ingestions "
+                                            f"SET status = '{final_status}', "
+                                            f"updated_at = now() "
+                                            f"WHERE id = '{job.ingestion_id}' RETURNING id"
+                                        )
+                                    },
+                                )
+        except Exception as db_err:
+            print(f"[epub-worker] Error updating DB on failure: {db_err}")
 
 
 @app.post("/extract-epub")
-async def extract_epub(req: EpubExtractRequest, x_api_key: str = Header(...)):
+async def submit_epub_job(
+    req: EpubExtractRequest,
+    background_tasks: BackgroundTasks,
+    x_api_key: str = Header(...),
+):
     """
-    Extract text and images from an EPUB file.
-
-    Accepts either a download URL (file_download_url) or raw base64 payload
-    (file_base64).  When the URL points to this file-receiver instance the
-    file is read directly from disk (zero network overhead).
-
-    Images are extracted directly from the EPUB ZIP — no cropping/OCR needed
-    because XHTML <img> tags define exact image boundaries.
-
-    If tenant_slug, knowledge_base_id, and doc_id are provided, images are
-    saved to disk and download URLs are included in the response.
-
-    Returns { text, chars, chapters, file_name, images, image_count }.
+    Submit an EPUB file for background extraction.
+    The worker extracts text and images, describes each image with Gemini,
+    saves results to disk, and calls back the pipeline when done.
     """
     verify_api_key(x_api_key)
 
-    epub_bytes: Optional[bytes] = None
+    job_id = f"{req.ingestion_id}_{req.file_index}"
 
-    if req.file_download_url:
-        # Try local path first (avoids HTTP round-trip for files already on disk)
-        local_path = _resolve_local_path(req.file_download_url)
-        if local_path:
-            print(f"[extract-epub] Reading local file: {local_path}")
-            epub_bytes = local_path.read_bytes()
-        else:
-            actual_url = _rewrite_to_localhost(req.file_download_url)
-            if actual_url != req.file_download_url:
-                print(f"[extract-epub] Rewritten URL: {req.file_download_url} → {actual_url}")
-            print(f"[extract-epub] Downloading: {actual_url}")
-            async with httpx.AsyncClient(timeout=120) as client:
-                resp = await client.get(actual_url, headers={"X-Api-Key": API_KEY})
-                resp.raise_for_status()
-                epub_bytes = resp.content
-
-    elif req.file_base64:
-        try:
-            epub_bytes = base64.b64decode(req.file_base64)
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid base64 EPUB data")
-
-    else:
-        raise HTTPException(
-            status_code=400,
-            detail="Provide file_download_url or file_base64",
-        )
-
-    if len(epub_bytes) > MAX_FILE_SIZE_MB * 1024 * 1024:
-        raise HTTPException(status_code=413, detail=f"EPUB too large. Max: {MAX_FILE_SIZE_MB}MB")
-
-    try:
-        text, chapter_count, extracted_images = _parse_epub_bytes(epub_bytes)
-    except Exception as e:
-        raise HTTPException(status_code=422, detail=f"EPUB parsing failed: {e}")
-
-    # Save extracted images to disk
-    file_receiver_base = os.getenv(
-        "FILE_RECEIVER_URL", "https://file-receiver.agentic.pl"
-    ).rstrip("/")
-    doc_path = get_doc_path(req.tenant_slug, req.knowledge_base_id, req.doc_id)
-
-    saved_images: list[dict] = []
-    for img_idx, img in enumerate(extracted_images):
-        raw_bytes = img["raw_bytes"]
-        ext = img.get("ext", ".jpg")
-        alt = img.get("alt", "")
-        img_filename = f"epub_image_{img_idx}{ext}"
-
-        img_b64 = base64.b64encode(raw_bytes).decode("ascii")
-        img_url = None
-
-        img_path = doc_path / img_filename
-        try:
-            img_path.write_bytes(raw_bytes)
-            img_url = (
-                f"{file_receiver_base}/files/{req.tenant_slug}/"
-                f"{req.knowledge_base_id}/{req.doc_id}/{img_filename}"
-            )
-            print(f"[extract-epub] Saved image: {img_filename} ({len(raw_bytes)} bytes)")
-        except Exception as img_err:
-            print(f"[extract-epub] Failed to save image {img_filename}: {img_err}")
-
-        saved_images.append({
-            "description": f"[Obraz EPUB: {os.path.basename(img.get('zip_path', ''))}] {alt}",
-            "section_context": "",
-            "page": img.get("chapter_idx", 0),
-            "page_image_base64": img_b64,
-            "image_url": img_url,
+    if job_id in epub_jobs and epub_jobs[job_id]["status"] == "processing":
+        return JSONResponse(status_code=409, content={
+            "error": "Job already running",
+            "job_id": job_id,
+            "status": epub_jobs[job_id],
         })
 
-    print(
-        f"[extract-epub] {req.file_name}: {len(text)} chars, "
-        f"{chapter_count} chapters, {len(saved_images)} images"
-    )
+    background_tasks.add_task(epub_worker_process, req)
 
+    return JSONResponse(status_code=202, content={
+        "job_id": job_id,
+        "message": f"EPUB extraction job accepted for {req.file_name}",
+        "status": "accepted",
+    })
+
+
+@app.get("/epub-job/{ingestion_id}/{file_index}")
+async def get_epub_job_status(
+    ingestion_id: str,
+    file_index: int,
+    x_api_key: str = Header(...),
+):
+    """Check status of an EPUB extraction job."""
+    verify_api_key(x_api_key)
+
+    job_id = f"{ingestion_id}_{file_index}"
+    if job_id not in epub_jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    return epub_jobs[job_id]
+
+
+@app.get("/epub-jobs")
+async def list_epub_jobs(x_api_key: str = Header(...)):
+    """List all EPUB extraction jobs."""
+    verify_api_key(x_api_key)
     return {
-        "text": text,
-        "chars": len(text),
-        "chapters": chapter_count,
-        "file_name": req.file_name,
-        "images": saved_images,
-        "image_count": len(saved_images),
+        "jobs": epub_jobs,
+        "total": len(epub_jobs),
+        "active": sum(1 for j in epub_jobs.values() if j["status"] == "processing"),
     }
