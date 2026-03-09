@@ -45,7 +45,9 @@ MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "500"))
 PDF_DPI = int(os.getenv("PDF_DPI", "150"))
 
 # AI Gateway for OCR
-LOVABLE_AI_GATEWAY = "https://ai.gateway.lovable.dev/v1/chat/completions"
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = "gemini-2.5-flash"
 QWEN_API_URL = "https://qwen.agentic.pl/v1/chat/completions"
 QWEN_MODEL = "Qwen/Qwen2.5-VL-7B-Instruct"
 
@@ -61,7 +63,7 @@ ocr_jobs: Dict[str, Dict[str, Any]] = {}
 
 app = FastAPI(
     title="BlueBox File Receiver",
-    version="4.4.0",
+    version="4.5.0",
     description="Tenant-isolated file storage + PDF-to-images + EPUB extraction + Background OCR Worker",
 )
 
@@ -122,18 +124,23 @@ class EpubExtractRequest(BaseModel):
     file_download_url: Optional[str] = None
     file_base64: Optional[str] = None
     file_name: str = "book.epub"
+    # Context for saving extracted images to disk
+    tenant_slug: str
+    knowledge_base_id: str
+    doc_id: str
 
 
 # ── EPUB helpers ───────────────────────────────────────────────
 
 
 class _HTMLToText(HTMLParser):
-    """Minimal HTML→Markdown-like text converter preserving headers and lists."""
+    """Minimal HTML→Markdown-like text converter preserving headers, lists, and image references."""
 
     def __init__(self):
         super().__init__()
         self._parts: list[str] = []
         self._tag_stack: list[str] = []
+        self._images: list[dict] = []  # collected image references
 
     def handle_starttag(self, tag, attrs):
         tag = tag.lower()
@@ -150,6 +157,14 @@ class _HTMLToText(HTMLParser):
             self._parts.append("- ")
         elif tag == "br":
             self._parts.append("\n")
+        elif tag == "img":
+            attrs_dict = dict(attrs)
+            src = attrs_dict.get("src", "")
+            alt = attrs_dict.get("alt", "")
+            if src:
+                img_idx = len(self._images)
+                self._images.append({"src": src, "alt": alt})
+                self._parts.append(f"\n![{alt}](epub_image:{img_idx})\n")
 
     def handle_endtag(self, tag):
         tag = tag.lower()
@@ -168,10 +183,12 @@ class _HTMLToText(HTMLParser):
         return text.strip()
 
 
-def _parse_epub_bytes(data: bytes) -> tuple[str, int]:
+def _parse_epub_bytes(data: bytes) -> tuple[str, int, list[dict]]:
     """
     Parse EPUB ZIP bytes → Markdown text following OPF spine order.
-    Returns (full_text, chapter_count).
+    Returns (full_text, chapter_count, images_list).
+    Images are extracted directly from the ZIP — no cropping needed
+    because XHTML <img> tags define exact image boundaries.
     """
     zf = zipfile.ZipFile(io.BytesIO(data))
 
@@ -196,13 +213,23 @@ def _parse_epub_bytes(data: bytes) -> tuple[str, int]:
         manifest[item.attrib.get("id", "")] = item.attrib.get("href", "")
     spine_ids = [ref.attrib["idref"] for ref in opf.findall(".//{*}itemref")]
 
-    # 3. Extract chapters in spine order
+    # Build case-insensitive lookup for ZIP entries
+    zip_names_lower = {n.lower(): n for n in zf.namelist()}
+    image_extensions = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff"}
+
+    # 3. Extract chapters in spine order, collecting images
     chapters: list[str] = []
-    for sid in spine_ids:
+    all_images: list[dict] = []
+
+    for chapter_idx, sid in enumerate(spine_ids):
         href = manifest.get(sid)
         if not href:
             continue
         full_path = opf_dir + href if opf_dir else href
+        chapter_dir = os.path.dirname(full_path)
+        if chapter_dir:
+            chapter_dir += "/"
+
         matching = [n for n in zf.namelist() if n.lower() == full_path.lower()]
         if not matching:
             continue
@@ -210,11 +237,39 @@ def _parse_epub_bytes(data: bytes) -> tuple[str, int]:
         parser = _HTMLToText()
         parser.feed(html_bytes.decode("utf-8", errors="replace"))
         text = parser.get_text()
+
+        # Resolve image references from this chapter's <img> tags
+        for img_info in parser._images:
+            src = img_info["src"]
+            # Resolve relative path (e.g. ../images/fig1.jpg)
+            if src.startswith("../") or not src.startswith("/"):
+                resolved = os.path.normpath(os.path.join(os.path.dirname(full_path), src))
+            else:
+                resolved = src.lstrip("/")
+            # Strip fragment/query
+            resolved = resolved.split("#")[0].split("?")[0]
+
+            zip_match = zip_names_lower.get(resolved.lower())
+            if zip_match:
+                ext = os.path.splitext(zip_match)[1].lower()
+                if ext in image_extensions:
+                    try:
+                        raw_bytes = zf.read(zip_match)
+                        all_images.append({
+                            "alt": img_info.get("alt", ""),
+                            "zip_path": zip_match,
+                            "chapter_idx": chapter_idx,
+                            "raw_bytes": raw_bytes,
+                            "ext": ext,
+                        })
+                    except Exception as e:
+                        print(f"[extract-epub] Failed to read image {zip_match}: {e}")
+
         if text.strip():
             chapters.append(text.strip())
 
     full_text = "\n\n---\n\n".join(chapters)
-    return full_text, len(chapters)
+    return full_text, len(chapters), all_images
 
 
 # ── Auth & tenant guard ───────────────────────────────────────
@@ -303,6 +358,7 @@ MIME_MAP = {
     ".rtf": "application/rtf",
     ".odt": "application/vnd.oasis.opendocument.text",
     ".epub": "application/epub+zip",
+    ".mobi": "application/x-mobipocket-ebook",
 }
 
 
@@ -374,9 +430,11 @@ async def ocr_call_gemini(
         api_key_val = qwen_api_key
         model = QWEN_MODEL
     else:
-        api_url = LOVABLE_AI_GATEWAY
-        api_key_val = api_key
-        model = "google/gemini-2.5-flash"
+        if not GEMINI_API_KEY:
+            raise ValueError("GEMINI_API_KEY is not configured — set it in environment variables")
+        api_url = GEMINI_API_URL
+        api_key_val = GEMINI_API_KEY
+        model = GEMINI_MODEL
 
     if extract_images:
         system_prompt = (
@@ -1550,13 +1608,19 @@ async def pdf_to_images(req: PdfToImagesRequest, x_api_key: str = Header(...)):
 @app.post("/extract-epub")
 async def extract_epub(req: EpubExtractRequest, x_api_key: str = Header(...)):
     """
-    Extract text from an EPUB file.
+    Extract text and images from an EPUB file.
 
     Accepts either a download URL (file_download_url) or raw base64 payload
     (file_base64).  When the URL points to this file-receiver instance the
     file is read directly from disk (zero network overhead).
 
-    Returns { text, chars, chapters, file_name }.
+    Images are extracted directly from the EPUB ZIP — no cropping/OCR needed
+    because XHTML <img> tags define exact image boundaries.
+
+    If tenant_slug, knowledge_base_id, and doc_id are provided, images are
+    saved to disk and download URLs are included in the response.
+
+    Returns { text, chars, chapters, file_name, images, image_count }.
     """
     verify_api_key(x_api_key)
 
@@ -1594,15 +1658,55 @@ async def extract_epub(req: EpubExtractRequest, x_api_key: str = Header(...)):
         raise HTTPException(status_code=413, detail=f"EPUB too large. Max: {MAX_FILE_SIZE_MB}MB")
 
     try:
-        text, chapter_count = _parse_epub_bytes(epub_bytes)
+        text, chapter_count, extracted_images = _parse_epub_bytes(epub_bytes)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"EPUB parsing failed: {e}")
+        raise HTTPException(status_code=422, detail=f"EPUB parsing failed: {e}")
 
-    print(f"[extract-epub] {req.file_name}: {len(text)} chars, {chapter_count} chapters")
+    # Save extracted images to disk
+    file_receiver_base = os.getenv(
+        "FILE_RECEIVER_URL", "https://file-receiver.agentic.pl"
+    ).rstrip("/")
+    doc_path = get_doc_path(req.tenant_slug, req.knowledge_base_id, req.doc_id)
+
+    saved_images: list[dict] = []
+    for img_idx, img in enumerate(extracted_images):
+        raw_bytes = img["raw_bytes"]
+        ext = img.get("ext", ".jpg")
+        alt = img.get("alt", "")
+        img_filename = f"epub_image_{img_idx}{ext}"
+
+        img_b64 = base64.b64encode(raw_bytes).decode("ascii")
+        img_url = None
+
+        img_path = doc_path / img_filename
+        try:
+            img_path.write_bytes(raw_bytes)
+            img_url = (
+                f"{file_receiver_base}/files/{req.tenant_slug}/"
+                f"{req.knowledge_base_id}/{req.doc_id}/{img_filename}"
+            )
+            print(f"[extract-epub] Saved image: {img_filename} ({len(raw_bytes)} bytes)")
+        except Exception as img_err:
+            print(f"[extract-epub] Failed to save image {img_filename}: {img_err}")
+
+        saved_images.append({
+            "description": f"[Obraz EPUB: {os.path.basename(img.get('zip_path', ''))}] {alt}",
+            "section_context": "",
+            "page": img.get("chapter_idx", 0),
+            "page_image_base64": img_b64,
+            "image_url": img_url,
+        })
+
+    print(
+        f"[extract-epub] {req.file_name}: {len(text)} chars, "
+        f"{chapter_count} chapters, {len(saved_images)} images"
+    )
 
     return {
         "text": text,
         "chars": len(text),
         "chapters": chapter_count,
         "file_name": req.file_name,
+        "images": saved_images,
+        "image_count": len(saved_images),
     }
