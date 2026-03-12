@@ -879,6 +879,16 @@ async def ocr_worker_process(job: OcrJobRequest):
         image_desc_tokens = job.settings.get("imageDescTokens", 200)
         pages_done = 0
 
+        # ── Token usage estimation ────────────────────────────────────────
+        # Each page OCR: ~765 input tokens (image) + ~200 (prompt) = ~965 input
+        # Output: page text ~3000 chars ≈ 750 tokens
+        # Image descriptions add ~200 tokens output each
+        EST_INPUT_TOKENS_PER_PAGE = 965
+        EST_OUTPUT_TOKENS_PER_PAGE = 750
+        EST_OUTPUT_TOKENS_PER_IMAGE_DESC = 200
+        total_input_tokens = 0
+        total_output_tokens = 0
+
         pages_dir = ocr_dir / "_images"
         if extract_images:
             pages_dir.mkdir(parents=True, exist_ok=True)
@@ -996,6 +1006,11 @@ async def ocr_worker_process(job: OcrJobRequest):
                     text = r["result"].get("text", "")
                     cropped = r.get("cropped_images", [])
                     pages_done += 1
+                    # Accumulate estimated token usage
+                    total_input_tokens += EST_INPUT_TOKENS_PER_PAGE
+                    page_output_est = max(EST_OUTPUT_TOKENS_PER_PAGE, len(text) // 4)
+                    num_images_detected = len(r["result"].get("images", []))
+                    total_output_tokens += page_output_est + (num_images_detected * EST_OUTPUT_TOKENS_PER_IMAGE_DESC)
 
                     with open(texts_jsonl, "a", encoding="utf-8") as fh:
                         fh.write(
@@ -1051,7 +1066,8 @@ async def ocr_worker_process(job: OcrJobRequest):
 
         print(
             f"[ocr-worker] OCR complete: {len(full_text)} chars, "
-            f"{len(all_images)} images from {total_pages} pages"
+            f"{len(all_images)} images from {total_pages} pages, "
+            f"est. tokens: {total_input_tokens} in / {total_output_tokens} out"
         )
 
         cropped_count = 0
@@ -1101,6 +1117,11 @@ async def ocr_worker_process(job: OcrJobRequest):
             "auth_token": job.auth_token,
             "_ocr_result_url": ocr_result_url,
             "_ocr_page_count": total_pages,
+            "_ocr_token_usage": {
+                "input_tokens": total_input_tokens,
+                "output_tokens": total_output_tokens,
+                "model": GEMINI_MODEL,
+            },
         }
 
         async with httpx.AsyncClient(timeout=300) as client:
@@ -1887,6 +1908,11 @@ async def epub_worker_process(job: EpubExtractRequest):
             "auth_token": job.auth_token,
             "_epub_result_url": epub_result_url,
             "_epub_chapter_count": chapter_count,
+            "_epub_token_usage": {
+                "input_tokens": total_images * 965,  # ~965 input tokens per image description call
+                "output_tokens": total_images * 200,  # ~200 output tokens per description
+                "model": GEMINI_MODEL,
+            },
         }
 
         async with httpx.AsyncClient(timeout=300) as client:
