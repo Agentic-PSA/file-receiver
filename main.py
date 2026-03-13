@@ -37,6 +37,14 @@ from enum import Enum
 
 import httpx
 
+
+class NonRetryableAPIError(Exception):
+    """Raised when all AI providers fail with non-retryable errors (400, 401, 403).
+    Outer retry loops should NOT retry on this — the request is fundamentally broken
+    (bad key, invalid payload, auth failure) and retrying will only waste time."""
+    pass
+
+
 # ── Configuration ──────────────────────────────────────────────
 
 STORAGE_ROOT = os.getenv("STORAGE_ROOT", "/data/files")
@@ -51,7 +59,7 @@ GEMINI_MODEL = "gemini-2.5-flash"
 OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = "gpt-4o-mini"
-QWEN_API_URL = "https://qwen.agentic.pl/v1/chat/completions"
+QWEN_API_URL = "https://172.16.10.119:8010/v1/chat/completions"
 QWEN_MODEL = "Qwen/Qwen2.5-VL-7B-Instruct"
 
 # OCR Worker config
@@ -469,7 +477,11 @@ async def _call_vision_with_fallback(
     if not providers:
         raise ValueError("No AI API keys configured (GEMINI_API_KEY or OPENAI_API_KEY required)")
 
+    RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+    NON_RETRYABLE_STATUS_CODES = {400, 401, 403}
+
     last_error = None
+    all_non_retryable = True  # track if every failure was non-retryable
 
     for provider in providers:
         for attempt in range(provider["max_retries"] + 1):
@@ -494,34 +506,46 @@ async def _call_vision_with_fallback(
                             print(f"[vision] Used {provider['name']} (attempt {attempt + 1})")
                         return resp.json()
 
-                    if resp.status_code in (429, 503) and attempt < provider["max_retries"]:
-                        wait = min(10 * (attempt + 1), 30)
-                        print(f"[vision] {provider['name']} {resp.status_code}, retry {attempt + 1}/{provider['max_retries']} in {wait}s")
-                        await resp.aread()
-                        await asyncio.sleep(wait)
-                        continue
-
-                    if resp.status_code in (429, 503):
-                        print(f"[vision] {provider['name']} exhausted retries ({resp.status_code}), trying next provider...")
+                    # Non-retryable client errors — skip to next provider immediately
+                    if resp.status_code in NON_RETRYABLE_STATUS_CODES:
                         await resp.aread()
                         last_error = f"{provider['name']} {resp.status_code}"
+                        print(f"[vision] {provider['name']} returned {resp.status_code} (non-retryable), trying next provider...")
                         break  # next provider
 
-                    # Non-retryable error
-                    resp.raise_for_status()
+                    # Retryable errors (429, 5xx) — retry within this provider
+                    if resp.status_code in RETRYABLE_STATUS_CODES:
+                        all_non_retryable = False
+                        if attempt < provider["max_retries"]:
+                            wait = min(10 * (attempt + 1), 30)
+                            print(f"[vision] {provider['name']} {resp.status_code}, retry {attempt + 1}/{provider['max_retries']} in {wait}s")
+                            await resp.aread()
+                            await asyncio.sleep(wait)
+                            continue
+                        else:
+                            print(f"[vision] {provider['name']} exhausted retries ({resp.status_code}), trying next provider...")
+                            await resp.aread()
+                            last_error = f"{provider['name']} {resp.status_code}"
+                            break  # next provider
 
-            except httpx.HTTPStatusError as e:
-                last_error = f"{provider['name']}: {e.response.status_code}"
-                if e.response.status_code in (429, 503):
+                    # Unknown error code — treat as non-retryable
+                    await resp.aread()
+                    last_error = f"{provider['name']} {resp.status_code}"
+                    print(f"[vision] {provider['name']} returned unexpected {resp.status_code}, trying next provider...")
                     break  # next provider
-                raise
+
             except Exception as e:
+                all_non_retryable = False
                 last_error = f"{provider['name']}: {e}"
                 if attempt < provider["max_retries"]:
                     await asyncio.sleep(5)
                 else:
                     break  # next provider
 
+    # If all providers failed with non-retryable errors, raise NonRetryableAPIError
+    # so outer retry loops know not to retry
+    if all_non_retryable:
+        raise NonRetryableAPIError(f"All AI providers failed with non-retryable errors. Last: {last_error}")
     raise RuntimeError(f"All AI providers failed. Last error: {last_error}")
 
 # ══════════════════════════════════════════════════════════════
@@ -662,6 +686,9 @@ async def _describe_image_with_retry(
     for attempt in range(3):
         try:
             return await describe_epub_image(img_b64, image_desc_tokens, mime_type)
+        except NonRetryableAPIError as exc:
+            print(f"[epub-worker] Image {img_idx} failed (non-retryable): {exc}")
+            return {"type": "unknown", "description": f"[DESCRIPTION ERROR: {exc}]"}
         except Exception as exc:
             if attempt < 2:
                 wait = 5 * (attempt + 1)
@@ -755,6 +782,9 @@ async def _ocr_page_with_retry(
                 extract_images=extract_images,
                 image_desc_tokens=image_desc_tokens,
             )
+        except NonRetryableAPIError as exc:
+            print(f"[ocr-worker] Page {page_num} failed (non-retryable): {exc}")
+            return {"text": f"[OCR ERROR: {exc}]", "images": []}
         except Exception as exc:
             if attempt < 2:
                 wait = 5 * (attempt + 1)
@@ -1290,13 +1320,6 @@ async def submit_ocr_job(
     RAM bounded, updates DB progress, and calls back the pipeline when done.
     """
     verify_api_key(x_api_key)
-    print(f"lovable_api_key: {req.lovable_api_key}")
-    print(f"supabase_service_role_key: {req.supabase_service_role_key}")
-    print(f"tenant_id: {req.tenant_id}")
-    print(f"ingestion_id: {req.ingestion_id}")
-    print(f"supabase_anon_key: {req.supabase_anon_key}")
-    print(f"file_download_url: {req.file_download_url}")
-    print(f"callback_url: {req.callback_url}")
 
     job_id = f"{req.ingestion_id}_{req.file_index}"
 
@@ -1801,6 +1824,25 @@ async def epub_worker_process(job: EpubExtractRequest):
 
         for batch_start in range(0, total_images, OCR_PAGE_CONCURRENCY):
             batch_end = min(batch_start + OCR_PAGE_CONCURRENCY, total_images)
+
+            # ── Heartbeat: check if job was cancelled ──────────────────────
+            if images_done > 0 and images_done % OCR_HEARTBEAT_INTERVAL == 0:
+                try:
+                    status = await update_heartbeat(
+                        job.supabase_url,
+                        job.supabase_service_role_key,
+                        job.tenant_id,
+                        job.ingestion_id,
+                        images_done,
+                        total_images,
+                    )
+                    if status in ("cancelled", "paused"):
+                        print(f"[epub-worker] Job {job_id} {status} by user, stopping.")
+                        epub_jobs[job_id]["status"] = status
+                        images_jsonl.unlink(missing_ok=True)
+                        return
+                except Exception as hb_err:
+                    print(f"[epub-worker] Heartbeat error: {hb_err}")
 
             async def process_image(idx: int) -> dict:
                 img = extracted_images[idx]
