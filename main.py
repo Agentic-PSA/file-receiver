@@ -1825,25 +1825,6 @@ async def epub_worker_process(job: EpubExtractRequest):
         for batch_start in range(0, total_images, OCR_PAGE_CONCURRENCY):
             batch_end = min(batch_start + OCR_PAGE_CONCURRENCY, total_images)
 
-            # ── Heartbeat: check if job was cancelled ──────────────────────
-            if images_done > 0 and images_done % OCR_HEARTBEAT_INTERVAL == 0:
-                try:
-                    status = await update_heartbeat(
-                        job.supabase_url,
-                        job.supabase_service_role_key,
-                        job.tenant_id,
-                        job.ingestion_id,
-                        images_done,
-                        total_images,
-                    )
-                    if status in ("cancelled", "paused"):
-                        print(f"[epub-worker] Job {job_id} {status} by user, stopping.")
-                        epub_jobs[job_id]["status"] = status
-                        images_jsonl.unlink(missing_ok=True)
-                        return
-                except Exception as hb_err:
-                    print(f"[epub-worker] Heartbeat error: {hb_err}")
-
             async def process_image(idx: int) -> dict:
                 img = extracted_images[idx]
                 raw_bytes = img["raw_bytes"]
@@ -1896,6 +1877,25 @@ async def epub_worker_process(job: EpubExtractRequest):
                 }
                 with open(images_jsonl, "a", encoding="utf-8") as fh:
                     fh.write(json.dumps(img_entry, ensure_ascii=False) + "\n")
+
+                # ── Heartbeat: check if job was cancelled ──────────────
+                if images_done > 0 and images_done % OCR_HEARTBEAT_INTERVAL == 0:
+                    try:
+                        status = await update_heartbeat(
+                            job.supabase_url,
+                            job.supabase_service_role_key,
+                            job.tenant_id,
+                            job.ingestion_id,
+                            images_done,
+                            total_images,
+                        )
+                        if status in ("cancelled", "paused"):
+                            print(f"[epub-worker] Job {job_id} {status} by user, stopping.")
+                            epub_jobs[job_id]["status"] = status
+                            images_jsonl.unlink(missing_ok=True)
+                            return
+                    except Exception as hb_err:
+                        print(f"[epub-worker] Heartbeat error: {hb_err}")
 
             epub_jobs[job_id]["images_done"] = images_done
             print(f"[epub-worker] Image progress: {images_done}/{total_images}")
