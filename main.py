@@ -16,6 +16,7 @@ import base64
 import functools
 import io
 import json
+import logging
 import os
 import re
 import uuid
@@ -36,6 +37,26 @@ from pydantic import BaseModel
 from enum import Enum
 
 import httpx
+
+# ── Logging ────────────────────────────────────────────────────
+_log_fmt = "%(asctime)s %(message)s"
+_log_datefmt = "%Y-%m-%d %H:%M"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format=_log_fmt,
+    datefmt=_log_datefmt,
+)
+logger = logging.getLogger("file-receiver")
+
+# Override uvicorn loggers so access logs also get timestamps
+for _uv_name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
+    _uv_logger = logging.getLogger(_uv_name)
+    _uv_logger.handlers.clear()
+    _uv_handler = logging.StreamHandler()
+    _uv_handler.setFormatter(logging.Formatter(_log_fmt, datefmt=_log_datefmt))
+    _uv_logger.addHandler(_uv_handler)
+    _uv_logger.propagate = False
 
 
 class NonRetryableAPIError(Exception):
@@ -292,7 +313,7 @@ def _parse_epub_bytes(data: bytes) -> tuple[str, int, list[dict]]:
                             "ext": ext,
                         })
                     except Exception as e:
-                        print(f"[extract-epub] Failed to read image {zip_match}: {e}")
+                        logger.info(f"[extract-epub] Failed to read image {zip_match}: {e}")
 
         if text.strip():
             chapters.append(text.strip())
@@ -503,14 +524,14 @@ async def _call_vision_with_fallback(
 
                     if resp.status_code == 200:
                         if provider["name"] != "Gemini":
-                            print(f"[vision] Used {provider['name']} (attempt {attempt + 1})")
+                            logger.info(f"[vision] Used {provider['name']} (attempt {attempt + 1})")
                         return resp.json()
 
                     # Non-retryable client errors — skip to next provider immediately
                     if resp.status_code in NON_RETRYABLE_STATUS_CODES:
                         await resp.aread()
                         last_error = f"{provider['name']} {resp.status_code}"
-                        print(f"[vision] {provider['name']} returned {resp.status_code} (non-retryable), trying next provider...")
+                        logger.info(f"[vision] {provider['name']} returned {resp.status_code} (non-retryable), trying next provider...")
                         break  # next provider
 
                     # Retryable errors (429, 5xx) — retry within this provider
@@ -518,12 +539,12 @@ async def _call_vision_with_fallback(
                         all_non_retryable = False
                         if attempt < provider["max_retries"]:
                             wait = min(10 * (attempt + 1), 30)
-                            print(f"[vision] {provider['name']} {resp.status_code}, retry {attempt + 1}/{provider['max_retries']} in {wait}s")
+                            logger.info(f"[vision] {provider['name']} {resp.status_code}, retry {attempt + 1}/{provider['max_retries']} in {wait}s")
                             await resp.aread()
                             await asyncio.sleep(wait)
                             continue
                         else:
-                            print(f"[vision] {provider['name']} exhausted retries ({resp.status_code}), trying next provider...")
+                            logger.info(f"[vision] {provider['name']} exhausted retries ({resp.status_code}), trying next provider...")
                             await resp.aread()
                             last_error = f"{provider['name']} {resp.status_code}"
                             break  # next provider
@@ -531,7 +552,7 @@ async def _call_vision_with_fallback(
                     # Unknown error code — treat as non-retryable
                     await resp.aread()
                     last_error = f"{provider['name']} {resp.status_code}"
-                    print(f"[vision] {provider['name']} returned unexpected {resp.status_code}, trying next provider...")
+                    logger.info(f"[vision] {provider['name']} returned unexpected {resp.status_code}, trying next provider...")
                     break  # next provider
 
             except Exception as e:
@@ -687,15 +708,15 @@ async def _describe_image_with_retry(
         try:
             return await describe_epub_image(img_b64, image_desc_tokens, mime_type)
         except NonRetryableAPIError as exc:
-            print(f"[epub-worker] Image {img_idx} failed (non-retryable): {exc}")
+            logger.info(f"[epub-worker] Image {img_idx} failed (non-retryable): {exc}")
             return {"type": "unknown", "description": f"[DESCRIPTION ERROR: {exc}]"}
         except Exception as exc:
             if attempt < 2:
                 wait = 5 * (attempt + 1)
-                print(f"[epub-worker] Image {img_idx} attempt {attempt + 1} failed: {exc}, retrying in {wait}s...")
+                logger.info(f"[epub-worker] Image {img_idx} attempt {attempt + 1} failed: {exc}, retrying in {wait}s...")
                 await asyncio.sleep(wait)
             else:
-                print(f"[epub-worker] Image {img_idx} description failed after 3 attempts: {exc}")
+                logger.info(f"[epub-worker] Image {img_idx} description failed after 3 attempts: {exc}")
                 return {"type": "unknown", "description": f"[DESCRIPTION ERROR: {exc}]"}
 
     return {"type": "unknown", "description": "[DESCRIPTION ERROR]"}
@@ -761,7 +782,7 @@ async def _get_tenant_slug(job: OcrJobRequest) -> Optional[str]:
             if tenants:
                 return tenants[0]["slug"]
     except Exception as e:
-        print(f"[ocr-worker] Failed to get tenant slug: {e}")
+        logger.error(f"[ocr-worker] Failed to get tenant slug: {e}")
     return None
 
 async def _ocr_page_with_retry(
@@ -783,15 +804,15 @@ async def _ocr_page_with_retry(
                 image_desc_tokens=image_desc_tokens,
             )
         except NonRetryableAPIError as exc:
-            print(f"[ocr-worker] Page {page_num} failed (non-retryable): {exc}")
+            logger.info(f"[ocr-worker] Page {page_num} failed (non-retryable): {exc}")
             return {"text": f"[OCR ERROR: {exc}]", "images": []}
         except Exception as exc:
             if attempt < 2:
                 wait = 5 * (attempt + 1)
-                print(f"[ocr-worker] Page {page_num} attempt {attempt + 1} failed: {exc}, retrying in {wait}s...")
+                logger.info(f"[ocr-worker] Page {page_num} attempt {attempt + 1} failed: {exc}, retrying in {wait}s...")
                 await asyncio.sleep(wait)
             else:
-                print(f"[ocr-worker] Page {page_num} failed after 3 attempts: {exc}")
+                logger.info(f"[ocr-worker] Page {page_num} failed after 3 attempts: {exc}")
                 return {"text": f"[OCR ERROR: {exc}]", "images": []}
 
     return {"text": "[OCR ERROR]", "images": []}
@@ -841,7 +862,7 @@ async def ocr_worker_process(job: OcrJobRequest):
         # Import here so startup does not fail if pdf2image is somehow missing
         from pdf2image import convert_from_path, pdfinfo_from_path
 
-        print(f"[ocr-worker] Starting job {job_id}: {job.file_name}")
+        logger.info(f"[ocr-worker] Starting job {job_id}: {job.file_name}")
 
         loop = asyncio.get_running_loop()
 
@@ -851,14 +872,14 @@ async def ocr_worker_process(job: OcrJobRequest):
         if job.file_download_url:
             local_path = _resolve_local_path(job.file_download_url)
             if local_path:
-                print(f"[ocr-worker] Local file found → copying {local_path} → {tmp_path}")
+                logger.info(f"[ocr-worker] Local file found → copying {local_path} → {tmp_path}")
                 shutil.copy2(str(local_path), tmp_path)
             else:
                 actual_url = _rewrite_to_localhost(job.file_download_url)
                 if actual_url != job.file_download_url:
-                    print(f"[ocr-worker] Rewritten URL: {job.file_download_url} → {actual_url}")
+                    logger.info(f"[ocr-worker] Rewritten URL: {job.file_download_url} → {actual_url}")
 
-                print(f"[ocr-worker] Streaming download → {tmp_path}")
+                logger.info(f"[ocr-worker] Streaming download → {tmp_path}")
                 async with httpx.AsyncClient(timeout=300) as client:
                     async with client.stream("GET", actual_url, headers={
                         "X-Api-Key": API_KEY,
@@ -869,7 +890,7 @@ async def ocr_worker_process(job: OcrJobRequest):
                                 fh.write(chunk)
 
         elif job.file_base64:
-            print(f"[ocr-worker] Decoding base64 → {tmp_path}")
+            logger.info(f"[ocr-worker] Decoding base64 → {tmp_path}")
             pdf_bytes = base64.b64decode(job.file_base64)
             with open(tmp_path, "wb") as fh:
                 fh.write(pdf_bytes)
@@ -879,7 +900,7 @@ async def ocr_worker_process(job: OcrJobRequest):
             raise ValueError("No file source provided (file_download_url or file_base64 required)")
 
         file_size_mb = os.path.getsize(tmp_path) / 1024 / 1024
-        print(f"[ocr-worker] PDF on disk: {file_size_mb:.1f} MB → {tmp_path}")
+        logger.info(f"[ocr-worker] PDF on disk: {file_size_mb:.1f} MB → {tmp_path}")
 
         # ── Step 2: Determine page count without loading any images ───────────
         info = await loop.run_in_executor(
@@ -888,7 +909,7 @@ async def ocr_worker_process(job: OcrJobRequest):
         )
         total_pages = info["Pages"]
         ocr_jobs[job_id]["total_pages"] = total_pages
-        print(f"[ocr-worker] Total pages: {total_pages}")
+        logger.info(f"[ocr-worker] Total pages: {total_pages}")
 
         # ── Step 3: Prepare incremental JSONL output files on disk ────────────
         tenant_slug = await _get_tenant_slug(job)
@@ -931,7 +952,7 @@ async def ocr_worker_process(job: OcrJobRequest):
             first_page = chunk_start_0 + 1
             last_page = chunk_end_0
 
-            print(
+            logger.info(
                 f"[ocr-worker] Rasterising pages {first_page}–{last_page} "
                 f"of {total_pages} (DPI={PDF_DPI})..."
             )
@@ -962,13 +983,13 @@ async def ocr_worker_process(job: OcrJobRequest):
                             total_pages,
                         )
                         if status in ("cancelled", "paused"):
-                            print(f"[ocr-worker] Job {job_id} {status} by user, stopping.")
+                            logger.info(f"[ocr-worker] Job {job_id} {status} by user, stopping.")
                             ocr_jobs[job_id]["status"] = status
                             texts_jsonl.unlink(missing_ok=True)
                             images_jsonl.unlink(missing_ok=True)
                             return
                     except Exception as hb_err:
-                        print(f"[ocr-worker] Heartbeat error: {hb_err}")
+                        logger.info(f"[ocr-worker] Heartbeat error: {hb_err}")
 
                 async def process_page(local_idx: int) -> Dict:
                     """Encode one PIL Image to JPEG/base64, OCR it, crop detected images."""
@@ -1010,7 +1031,7 @@ async def ocr_worker_process(job: OcrJobRequest):
                             lower = int(y_max / 1000 * img_height)
 
                             if (right - left) < 20 or (lower - upper) < 20:
-                                print(f"[ocr-worker] Page {global_page_num} img {img_idx}: bbox too small, skipping crop")
+                                logger.info(f"[ocr-worker] Page {global_page_num} img {img_idx}: bbox too small, skipping crop")
                                 cropped_images.append(None)
                                 continue
 
@@ -1020,7 +1041,7 @@ async def ocr_worker_process(job: OcrJobRequest):
                             cropped.save(str(crop_path), format="JPEG", quality=90)
                             cropped_images.append(crop_filename)
                         except Exception as crop_err:
-                            print(f"[ocr-worker] Page {global_page_num} img {img_idx}: crop failed: {crop_err}")
+                            logger.info(f"[ocr-worker] Page {global_page_num} img {img_idx}: crop failed: {crop_err}")
                             cropped_images.append(None)
 
                     return {
@@ -1070,7 +1091,7 @@ async def ocr_worker_process(job: OcrJobRequest):
                             )
 
                 ocr_jobs[job_id]["pages_done"] = pages_done
-                print(f"[ocr-worker] Progress: {pages_done}/{total_pages} pages")
+                logger.info(f"[ocr-worker] Progress: {pages_done}/{total_pages} pages")
 
                 if batch_end < len(chunk_images):
                     await asyncio.sleep(0.5)
@@ -1078,7 +1099,7 @@ async def ocr_worker_process(job: OcrJobRequest):
             del chunk_images
 
         # ── Step 5: Assemble final result from JSONL files ────────────────────
-        print("[ocr-worker] Assembling OCR result from JSONL files...")
+        logger.info("[ocr-worker] Assembling OCR result from JSONL files...")
 
         page_texts: Dict[int, str] = {}
         with open(texts_jsonl, "r", encoding="utf-8") as fh:
@@ -1095,7 +1116,7 @@ async def ocr_worker_process(job: OcrJobRequest):
                 for line in fh:
                     all_images.append(json.loads(line))
 
-        print(
+        logger.info(
             f"[ocr-worker] OCR complete: {len(full_text)} chars, "
             f"{len(all_images)} images from {total_pages} pages, "
             f"est. tokens: {total_input_tokens} in / {total_output_tokens} out"
@@ -1104,7 +1125,7 @@ async def ocr_worker_process(job: OcrJobRequest):
         cropped_count = 0
         if extract_images and pages_dir.exists():
             cropped_count = len(list(pages_dir.glob("page_*_img_*.jpg")))
-            print(f"[ocr-worker] Saved {cropped_count} cropped images to {pages_dir}")
+            logger.info(f"[ocr-worker] Saved {cropped_count} cropped images to {pages_dir}")
 
         ocr_result_file = ocr_dir / "_ocr_result.json"
         with open(ocr_result_file, "w", encoding="utf-8") as fh:
@@ -1120,7 +1141,7 @@ async def ocr_worker_process(job: OcrJobRequest):
             )
 
         result_size_mb = ocr_result_file.stat().st_size / 1024 / 1024
-        print(f"[ocr-worker] OCR result saved: {ocr_result_file} ({result_size_mb:.1f} MB)")
+        logger.info(f"[ocr-worker] OCR result saved: {ocr_result_file} ({result_size_mb:.1f} MB)")
 
         texts_jsonl.unlink(missing_ok=True)
         images_jsonl.unlink(missing_ok=True)
@@ -1132,7 +1153,7 @@ async def ocr_worker_process(job: OcrJobRequest):
             f"?download=true"
         )
 
-        print(f"[ocr-worker] Calling back pipeline at {job.callback_url}")
+        logger.info(f"[ocr-worker] Calling back pipeline at {job.callback_url}")
         callback_body = {
             "file_name": job.file_name,
             "file_id": job.file_id,
@@ -1165,17 +1186,17 @@ async def ocr_worker_process(job: OcrJobRequest):
                 json=callback_body,
             )
             if resp.status_code >= 400:
-                print(f"[ocr-worker] Callback failed: {resp.status_code} {resp.text[:500]}")
+                logger.error(f"[ocr-worker] Callback failed: {resp.status_code} {resp.text[:500]}")
             else:
-                print(f"[ocr-worker] Callback success: {resp.status_code}")
+                logger.info(f"[ocr-worker] Callback success: {resp.status_code}")
 
         ocr_jobs[job_id]["status"] = "completed"
         ocr_jobs[job_id]["pages_done"] = total_pages
 
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
-        print(f"[ocr-worker] Job {job_id} failed: {error_msg}")
-        print(traceback.format_exc())
+        logger.error(f"[ocr-worker] Job {job_id} failed: {error_msg}")
+        logger.error(traceback.format_exc())
         ocr_jobs[job_id]["status"] = "failed"
         ocr_jobs[job_id]["error"] = error_msg
 
@@ -1271,15 +1292,15 @@ async def ocr_worker_process(job: OcrJobRequest):
                                     },
                                 )
         except Exception as db_err:
-            print(f"[ocr-worker] Error updating DB on failure: {db_err}")
+            logger.error(f"[ocr-worker] Error updating DB on failure: {db_err}")
 
     finally:
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.unlink(tmp_path)
-                print(f"[ocr-worker] Temp file removed: {tmp_path}")
+                logger.info(f"[ocr-worker] Temp file removed: {tmp_path}")
             except Exception as cleanup_err:
-                print(f"[ocr-worker] Failed to remove temp file {tmp_path}: {cleanup_err}")
+                logger.error(f"[ocr-worker] Failed to remove temp file {tmp_path}: {cleanup_err}")
 
 # ── Endpoints ──────────────────────────────────────────────────
 
@@ -1776,7 +1797,7 @@ async def epub_worker_process(job: EpubExtractRequest):
     }
 
     try:
-        print(f"[epub-worker] Starting job {job_id}: {job.file_name}")
+        logger.info(f"[epub-worker] Starting job {job_id}: {job.file_name}")
 
         # ── Step 1: Get EPUB bytes ─────────────────────────────────────────
         epub_bytes: Optional[bytes] = None
@@ -1784,13 +1805,13 @@ async def epub_worker_process(job: EpubExtractRequest):
         if job.file_download_url:
             local_path = _resolve_local_path(job.file_download_url)
             if local_path:
-                print(f"[epub-worker] Local file found: {local_path}")
+                logger.info(f"[epub-worker] Local file found: {local_path}")
                 epub_bytes = local_path.read_bytes()
             else:
                 actual_url = _rewrite_to_localhost(job.file_download_url)
                 if actual_url != job.file_download_url:
-                    print(f"[epub-worker] Rewritten URL: {job.file_download_url} → {actual_url}")
-                print(f"[epub-worker] Downloading: {actual_url}")
+                    logger.info(f"[epub-worker] Rewritten URL: {job.file_download_url} → {actual_url}")
+                logger.info(f"[epub-worker] Downloading: {actual_url}")
                 async with httpx.AsyncClient(timeout=120) as client:
                     resp = await client.get(actual_url, headers={"X-Api-Key": API_KEY})
                     resp.raise_for_status()
@@ -1800,7 +1821,7 @@ async def epub_worker_process(job: EpubExtractRequest):
         else:
             raise ValueError("No file source provided (file_download_url or file_base64 required)")
 
-        print(f"[epub-worker] EPUB size: {len(epub_bytes) / 1024:.1f} KB")
+        logger.info(f"[epub-worker] EPUB size: {len(epub_bytes) / 1024:.1f} KB")
 
         # ── Step 2: Parse EPUB ─────────────────────────────────────────────
         text, chapter_count, extracted_images = _parse_epub_bytes(epub_bytes)
@@ -1808,7 +1829,7 @@ async def epub_worker_process(job: EpubExtractRequest):
 
         total_images = len(extracted_images)
         epub_jobs[job_id]["total_images"] = total_images
-        print(f"[epub-worker] Parsed: {len(text)} chars, {chapter_count} chapters, {total_images} images")
+        logger.info(f"[epub-worker] Parsed: {len(text)} chars, {chapter_count} chapters, {total_images} images")
 
         # ── Step 3: Save images to disk + describe with AI ─────────────────
         file_receiver_base = os.getenv(
@@ -1843,7 +1864,7 @@ async def epub_worker_process(job: EpubExtractRequest):
                         f"{job.knowledge_base_id}/{job.doc_id}/{img_filename}"
                     )
                 except Exception as save_err:
-                    print(f"[epub-worker] Failed to save image {img_filename}: {save_err}")
+                    logger.info(f"[epub-worker] Failed to save image {img_filename}: {save_err}")
 
                 # Describe with AI (Gemini → OpenAI fallback)
                 img_b64 = base64.b64encode(raw_bytes).decode("ascii")
@@ -1890,15 +1911,15 @@ async def epub_worker_process(job: EpubExtractRequest):
                             total_images,
                         )
                         if status in ("cancelled", "paused"):
-                            print(f"[epub-worker] Job {job_id} {status} by user, stopping.")
+                            logger.info(f"[epub-worker] Job {job_id} {status} by user, stopping.")
                             epub_jobs[job_id]["status"] = status
                             images_jsonl.unlink(missing_ok=True)
                             return
                     except Exception as hb_err:
-                        print(f"[epub-worker] Heartbeat error: {hb_err}")
+                        logger.info(f"[epub-worker] Heartbeat error: {hb_err}")
 
             epub_jobs[job_id]["images_done"] = images_done
-            print(f"[epub-worker] Image progress: {images_done}/{total_images}")
+            logger.info(f"[epub-worker] Image progress: {images_done}/{total_images}")
 
             # Small back-off between batches to respect API rate limits
             if batch_end < total_images:
@@ -1926,7 +1947,7 @@ async def epub_worker_process(job: EpubExtractRequest):
             )
 
         result_size_mb = result_file.stat().st_size / 1024 / 1024
-        print(f"[epub-worker] Result saved: {result_file} ({result_size_mb:.1f} MB)")
+        logger.info(f"[epub-worker] Result saved: {result_file} ({result_size_mb:.1f} MB)")
 
         # ── Step 5: Lightweight callback ───────────────────────────────────
         epub_result_url = (
@@ -1935,7 +1956,7 @@ async def epub_worker_process(job: EpubExtractRequest):
             f"?download=true"
         )
 
-        print(f"[epub-worker] Calling back pipeline at {job.callback_url}")
+        logger.info(f"[epub-worker] Calling back pipeline at {job.callback_url}")
         callback_body = {
             "file_name": job.file_name,
             "file_id": job.file_id,
@@ -1968,17 +1989,17 @@ async def epub_worker_process(job: EpubExtractRequest):
                 json=callback_body,
             )
             if resp.status_code >= 400:
-                print(f"[epub-worker] Callback failed: {resp.status_code} {resp.text[:500]}")
+                logger.error(f"[epub-worker] Callback failed: {resp.status_code} {resp.text[:500]}")
             else:
-                print(f"[epub-worker] Callback success: {resp.status_code}")
+                logger.info(f"[epub-worker] Callback success: {resp.status_code}")
 
         epub_jobs[job_id]["status"] = "completed"
         epub_jobs[job_id]["images_done"] = total_images
 
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
-        print(f"[epub-worker] Job {job_id} failed: {error_msg}")
-        print(traceback.format_exc())
+        logger.error(f"[epub-worker] Job {job_id} failed: {error_msg}")
+        logger.error(traceback.format_exc())
         epub_jobs[job_id]["status"] = "failed"
         epub_jobs[job_id]["error"] = error_msg
 
@@ -2074,7 +2095,7 @@ async def epub_worker_process(job: EpubExtractRequest):
                                     },
                                 )
         except Exception as db_err:
-            print(f"[epub-worker] Error updating DB on failure: {db_err}")
+            logger.error(f"[epub-worker] Error updating DB on failure: {db_err}")
 
 @app.post("/extract-epub")
 async def submit_epub_job(
