@@ -81,6 +81,7 @@ OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = "gpt-4o-mini"
 QWEN_API_URL = "https://172.16.10.119:8010/v1/chat/completions"
+QWEN_API_KEY = os.getenv("QWEN_API_KEY", "")
 QWEN_MODEL = "Qwen/Qwen2.5-VL-7B-Instruct"
 
 # OCR Worker config
@@ -98,8 +99,8 @@ epub_jobs: Dict[str, Dict[str, Any]] = {}
 
 app = FastAPI(
     title="BlueBox File Receiver",
-    version="4.7.0",
-    description="Tenant-isolated file storage + PDF-to-images + Background OCR Worker + Background EPUB extraction",
+    version="4.8.0",
+    description="Tenant-isolated file storage + PDF-to-images + Background OCR Worker + Background EPUB extraction + PII anonymization",
 )
 
 # ── Models ─────────────────────────────────────────────────────
@@ -172,6 +173,7 @@ class EpubExtractRequest(BaseModel):
     # Processing settings
     settings: Dict[str, Any] = {}
     image_desc_tokens: int = 200
+    anonymize: bool = False
 
     # Auth
     supabase_url: str
@@ -233,10 +235,10 @@ class _HTMLToText(HTMLParser):
         text = re.sub(r"\n{3,}", "\n\n", text)
         return text.strip()
 
-def _parse_epub_bytes(data: bytes) -> tuple[str, int, list[dict]]:
+def _parse_epub_bytes(data: bytes) -> tuple[list[str], int, list[dict]]:
     """
-    Parse EPUB ZIP bytes → Markdown text following OPF spine order.
-    Returns (full_text, chapter_count, images_list).
+    Parse EPUB ZIP bytes → list of chapter texts following OPF spine order.
+    Returns (chapters_list, chapter_count, images_list).
     Images are extracted directly from the ZIP — no cropping needed
     because XHTML <img> tags define exact image boundaries.
     """
@@ -318,8 +320,7 @@ def _parse_epub_bytes(data: bytes) -> tuple[str, int, list[dict]]:
         if text.strip():
             chapters.append(text.strip())
 
-    full_text = "\n\n---\n\n".join(chapters)
-    return full_text, len(chapters), all_images
+    return chapters, len(chapters), all_images
 
 # ── Auth & tenant guard ───────────────────────────────────────
 
@@ -469,10 +470,11 @@ async def _call_vision_with_fallback(
     """
     providers = []
 
-    if force_qwen and qwen_api_key:
+    effective_qwen_key = qwen_api_key or QWEN_API_KEY
+    if force_qwen and effective_qwen_key:
         providers.append({
             "url": QWEN_API_URL,
-            "key": qwen_api_key,
+            "key": effective_qwen_key,
             "model": QWEN_MODEL,
             "name": "Qwen",
             "max_retries": 2,
@@ -584,22 +586,22 @@ async def ocr_call_gemini(
     """Call Vision API for a single page image OCR with Gemini→OpenAI fallback."""
     if extract_images:
         system_prompt = (
-            "Jestes ekspertem od ekstrakcji tresci z dokumentow. Wykonaj DWA zadania:\n"
-            "1. EKSTRAKCJA TEKSTU: Przepisz dokladnie CALY tekst w Markdown.\n"
-            "2. DETEKCJA OBRAZOW: Zidentyfikuj elementy graficzne (zdjecia, wykresy, diagramy, schematy, logo). "
-            "NIE oznaczaj tabel, naglowkow, stopek ani dekoracji jako obrazy.\n"
-            f"Dla kazdego obrazu podaj typ, opis (max {image_desc_tokens} tokenow) "
-            "oraz wspolrzedne bbox jako [y_min, x_min, y_max, x_max] w skali 0-1000 "
-            "(0,0 = lewy gorny rog, 1000,1000 = prawy dolny rog). "
-            "Pusta lista jesli brak obrazow.\n\n"
-            'Odpowiedz WYLACZNIE JSON:\n'
+            "Jesteś ekspertem od ekstrakcji treści z dokumentów. Wykonaj DWA zadania:\n"
+            "1. EKSTRAKCJA TEKSTU: Przepisz dokładnie CAŁY tekst w Markdown.\n"
+            "2. DETEKCJA OBRAZÓW: Zidentyfikuj elementy graficzne (zdjęcia, wykresy, diagramy, schematy, logo). "
+            "NIE oznaczaj tabel, nagłówków, stopek ani dekoracji jako obrazy.\n"
+            f"Dla każdego obrazu podaj typ, opis (max {image_desc_tokens} tokenów) "
+            "oraz współrzędne bbox jako [y_min, x_min, y_max, x_max] w skali 0-1000 "
+            "(0,0 = lewy górny róg, 1000,1000 = prawy dolny róg). "
+            "Pusta lista jeśli brak obrazów.\n\n"
+            'Odpowiedz WYŁĄCZNIE JSON:\n'
             '{"text": "...", "images": [{"type": "...", "description": "...", "bbox": [y_min, x_min, y_max, x_max]}]}'
         )
     else:
         system_prompt = (
-            "Przepisz dokladnie caly tekst widoczny na tym obrazie strony dokumentu. "
-            "Zachowaj oryginalna strukture: naglowki, akapity, punkty, tabele w formacie Markdown.\n\n"
-            'Odpowiedz WYLACZNIE JSON: {"text": "wyekstrahowany tekst..."}'
+            "Przepisz dokładnie cały tekst widoczny na tym obrazie strony dokumentu. "
+            "Zachowaj oryginalną strukturę: nagłówki, akapity, punkty, tabele w formacie Markdown.\n\n"
+            'Odpowiedz WYŁĄCZNIE JSON: {"text": "wyekstrahowany tekst..."}'
         )
 
     messages = [
@@ -617,7 +619,7 @@ async def ocr_call_gemini(
         messages=messages,
         max_tokens=8000,
         temperature=0,
-        force_qwen=(anonymize and bool(qwen_api_key)),
+        force_qwen=anonymize,
         qwen_api_key=qwen_api_key,
     )
 
@@ -641,11 +643,12 @@ async def describe_epub_image(
     image_base64: str,
     image_desc_tokens: int = 200,
     mime_type: str = "image/jpeg",
+    anonymize: bool = False,
 ) -> Dict[str, str]:
     """
     Call Vision API to describe a single image extracted from an EPUB.
     Returns {"type": "...", "description": "..."}.
-    Uses Gemini → OpenAI fallback chain.
+    Uses Gemini → OpenAI fallback chain, or Qwen when anonymize=True.
     """
     system_prompt = (
         "Jestes ekspertem od analizy obrazow w dokumentach. "
@@ -677,6 +680,7 @@ async def describe_epub_image(
         messages=messages,
         max_tokens=2000,
         temperature=0,
+        force_qwen=anonymize,
     )
 
     content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
@@ -702,11 +706,12 @@ async def _describe_image_with_retry(
     image_desc_tokens: int,
     mime_type: str,
     img_idx: int,
+    anonymize: bool = False,
 ) -> Dict[str, str]:
     """Describe a single image with up to 3 retries and rate-limit back-off."""
     for attempt in range(3):
         try:
-            return await describe_epub_image(img_b64, image_desc_tokens, mime_type)
+            return await describe_epub_image(img_b64, image_desc_tokens, mime_type, anonymize=anonymize)
         except NonRetryableAPIError as exc:
             logger.info(f"[epub-worker] Image {img_idx} failed (non-retryable): {exc}")
             return {"type": "unknown", "description": f"[DESCRIPTION ERROR: {exc}]"}
@@ -720,6 +725,138 @@ async def _describe_image_with_retry(
                 return {"type": "unknown", "description": f"[DESCRIPTION ERROR: {exc}]"}
 
     return {"type": "unknown", "description": "[DESCRIPTION ERROR]"}
+
+# ══════════════════════════════════════════════════════════════
+# PII Anonymization — tag sensitive data via Qwen
+# ══════════════════════════════════════════════════════════════
+
+ANONYMIZE_SYSTEM_PROMPT = (
+    "Jesteś ekspertem od ochrony danych osobowych. Twoim zadaniem jest oznaczenie "
+    "danych wrażliwych w tekście za pomocą tagów XML.\n\n"
+    "Kategorie danych do oznaczenia:\n"
+    "- <first_name>...</first_name> — imię człowieka\n"
+    "- <last_name>...</last_name> — nazwisko człowieka\n"
+    "- <company>...</company> — nazwa firmy\n"
+    "- <email>...</email> — adres email\n"
+    "- <phone>...</phone> — numer telefonu\n"
+    "- <nip>...</nip> — numer NIP\n"
+    "- <regon>...</regon> — numer REGON\n"
+    "- <krs>...</krs> — numer KRS\n"
+    "- <address>...</address> — ulica z numerem domu i ewentualnie numerem mieszkania\n"
+    "- <account>...</account> — numer konta bankowego\n"
+    "- <pesel>...</pesel> — numer PESEL\n"
+    "- <document>...</document> — nazwa/numer dokumentu (dowód, paszport, itp.)\n\n"
+    "ZASADY:\n"
+    "1. Zwróć CAŁY tekst z oznaczonymi danymi wrażliwymi.\n"
+    "2. NIE zmieniaj żadnego innego tekstu — zachowaj dokładnie taką samą treść i formatowanie.\n"
+    "3. NIE dodawaj żadnych komentarzy, wyjaśnień ani dodatkowego tekstu.\n"
+    "4. Jeśli w tekście nie ma danych wrażliwych, zwróć go bez zmian.\n"
+    "5. Odpowiedz WYŁĄCZNIE tekstem z oznaczeniami, bez żadnych prefixów ani suffixów."
+)
+
+# ~10 000 tokens ≈ ~40 000 chars (conservative 4 chars/token estimate)
+ANONYMIZE_MAX_CHARS = 40000
+
+
+def _split_text_for_anonymization(text: str, max_chars: int = ANONYMIZE_MAX_CHARS) -> list[str]:
+    """
+    Split text into chunks of approximately max_chars, breaking on sentence
+    boundaries (period/exclamation/question mark followed by whitespace or newline).
+    No overlap between chunks.
+    """
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks: list[str] = []
+    start = 0
+
+    while start < len(text):
+        if start + max_chars >= len(text):
+            chunks.append(text[start:])
+            break
+
+        # Look for the last sentence boundary within max_chars
+        window = text[start:start + max_chars]
+        # Search backwards for sentence-ending punctuation followed by space/newline
+        split_pos = -1
+        for i in range(len(window) - 1, -1, -1):
+            if window[i] in ".!?\n" and (i + 1 >= len(window) or window[i + 1] in " \n\r\t"):
+                split_pos = i + 1
+                break
+
+        if split_pos <= 0:
+            # No sentence boundary found — split at max_chars
+            split_pos = max_chars
+
+        chunks.append(text[start:start + split_pos])
+        start += split_pos
+
+    return chunks
+
+
+async def _anonymize_text_chunk(text: str, qwen_api_key: Optional[str] = None) -> str:
+    """Call Qwen to tag PII in a single text chunk."""
+    messages = [
+        {"role": "system", "content": ANONYMIZE_SYSTEM_PROMPT},
+        {"role": "user", "content": text},
+    ]
+
+    result = await _call_vision_with_fallback(
+        messages=messages,
+        max_tokens=16000,
+        temperature=0,
+        force_qwen=True,
+        qwen_api_key=qwen_api_key,
+    )
+
+    content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+    return content.strip() if content else text
+
+
+async def _anonymize_text_with_retry(
+    text: str,
+    context: str,
+    qwen_api_key: Optional[str] = None,
+) -> str:
+    """Anonymize a text chunk with up to 3 retries."""
+    for attempt in range(3):
+        try:
+            return await _anonymize_text_chunk(text, qwen_api_key)
+        except NonRetryableAPIError as exc:
+            logger.error(f"[anonymize] {context} failed (non-retryable): {exc}")
+            return text  # return original on non-retryable failure
+        except Exception as exc:
+            if attempt < 2:
+                wait = 5 * (attempt + 1)
+                logger.info(f"[anonymize] {context} attempt {attempt + 1} failed: {exc}, retrying in {wait}s...")
+                await asyncio.sleep(wait)
+            else:
+                logger.error(f"[anonymize] {context} failed after 3 attempts: {exc}")
+                return text  # return original on total failure
+    return text
+
+
+async def anonymize_text(
+    text: str,
+    context: str = "",
+    qwen_api_key: Optional[str] = None,
+) -> str:
+    """
+    Orchestrator: split text into ~10k-token chunks if needed,
+    anonymize each chunk sequentially via Qwen, and rejoin.
+    """
+    if not text or not text.strip():
+        return text
+
+    chunks = _split_text_for_anonymization(text)
+    anonymized_chunks: list[str] = []
+
+    for i, chunk in enumerate(chunks):
+        chunk_ctx = f"{context} chunk {i + 1}/{len(chunks)}" if len(chunks) > 1 else context
+        result = await _anonymize_text_with_retry(chunk, chunk_ctx, qwen_api_key)
+        anonymized_chunks.append(result)
+
+    return "".join(anonymized_chunks)
 
 async def update_heartbeat(
     supabase_url: str,
@@ -1064,6 +1201,14 @@ async def ocr_worker_process(job: OcrJobRequest):
                     num_images_detected = len(r["result"].get("images", []))
                     total_output_tokens += page_output_est + (num_images_detected * EST_OUTPUT_TOKENS_PER_IMAGE_DESC)
 
+                    # ── PII anonymization (sequential, one page at a time) ──
+                    if job.anonymize and text:
+                        text = await anonymize_text(
+                            text,
+                            context=f"page {page_num}",
+                            qwen_api_key=job.qwen_api_key,
+                        )
+
                     with open(texts_jsonl, "a", encoding="utf-8") as fh:
                         fh.write(
                             json.dumps({"page": page_num, "text": text}, ensure_ascii=False) + "\n"
@@ -1071,11 +1216,19 @@ async def ocr_worker_process(job: OcrJobRequest):
 
                     for img_idx, img_info in enumerate(r["result"].get("images", [])):
                         crop_filename = cropped[img_idx] if img_idx < len(cropped) else None
+                        img_description = (
+                            f"[Image: {img_info.get('type', 'unknown')}, "
+                            f"page {page_num}] {img_info.get('description', '')}"
+                        )
+                        # Anonymize image description
+                        if job.anonymize and img_description:
+                            img_description = await anonymize_text(
+                                img_description,
+                                context=f"page {page_num} img {img_idx}",
+                                qwen_api_key=job.qwen_api_key,
+                            )
                         img_entry = {
-                            "description": (
-                                f"[Image: {img_info.get('type', 'unknown')}, "
-                                f"page {page_num}] {img_info.get('description', '')}"
-                            ),
+                            "description": img_description,
                             "section_context": text[:1000] if text else "",
                             "page": page_num,
                             "bbox": img_info.get("bbox"),
@@ -1824,12 +1977,25 @@ async def epub_worker_process(job: EpubExtractRequest):
         logger.info(f"[epub-worker] EPUB size: {len(epub_bytes) / 1024:.1f} KB")
 
         # ── Step 2: Parse EPUB ─────────────────────────────────────────────
-        text, chapter_count, extracted_images = _parse_epub_bytes(epub_bytes)
+        chapters, chapter_count, extracted_images = _parse_epub_bytes(epub_bytes)
         del epub_bytes  # free RAM
 
         total_images = len(extracted_images)
         epub_jobs[job_id]["total_images"] = total_images
-        logger.info(f"[epub-worker] Parsed: {len(text)} chars, {chapter_count} chapters, {total_images} images")
+        total_chars = sum(len(c) for c in chapters)
+        logger.info(f"[epub-worker] Parsed: {total_chars} chars, {chapter_count} chapters, {total_images} images")
+
+        # ── Step 2b: Anonymize chapter texts if requested ─────────────────
+        if job.anonymize and chapters:
+            logger.info(f"[epub-worker] Anonymizing {chapter_count} chapters via Qwen...")
+            for ch_idx in range(len(chapters)):
+                chapters[ch_idx] = await anonymize_text(
+                    chapters[ch_idx],
+                    context=f"chapter {ch_idx + 1}/{chapter_count}",
+                )
+            logger.info(f"[epub-worker] Chapter anonymization complete")
+
+        text = "\n\n---\n\n".join(chapters)
 
         # ── Step 3: Save images to disk + describe with AI ─────────────────
         file_receiver_base = os.getenv(
@@ -1866,10 +2032,11 @@ async def epub_worker_process(job: EpubExtractRequest):
                 except Exception as save_err:
                     logger.info(f"[epub-worker] Failed to save image {img_filename}: {save_err}")
 
-                # Describe with AI (Gemini → OpenAI fallback)
+                # Describe with AI (Qwen when anonymize=True, else Gemini → OpenAI)
                 img_b64 = base64.b64encode(raw_bytes).decode("ascii")
                 desc = await _describe_image_with_retry(
                     img_b64, image_desc_tokens, mime_type, idx,
+                    anonymize=job.anonymize,
                 )
 
                 return {
@@ -1886,12 +2053,19 @@ async def epub_worker_process(job: EpubExtractRequest):
 
             for r in results:
                 images_done += 1
+                img_description = (
+                    f"[Image: {r['description'].get('type', 'unknown')}, "
+                    f"chapter {r['chapter_idx']}] "
+                    f"{r['description'].get('description', r['alt'])}"
+                )
+                # Anonymize image description
+                if job.anonymize and img_description:
+                    img_description = await anonymize_text(
+                        img_description,
+                        context=f"epub img {r['idx']}",
+                    )
                 img_entry = {
-                    "description": (
-                        f"[Image: {r['description'].get('type', 'unknown')}, "
-                        f"chapter {r['chapter_idx']}] "
-                        f"{r['description'].get('description', r['alt'])}"
-                    ),
+                    "description": img_description,
                     "section_context": "",
                     "page": r["chapter_idx"],
                     "image_url": r["img_url"],
