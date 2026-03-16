@@ -100,7 +100,7 @@ epub_jobs: Dict[str, Dict[str, Any]] = {}
 app = FastAPI(
     title="BlueBox File Receiver",
     version="4.8.0",
-    description="Tenant-isolated file storage + PDF-to-images + Background OCR Worker + Background EPUB extraction + PII anonymization",
+    description="Tenant-isolated file storage + PDF-to-images + Background OCR Worker + Background EPUB extraction + Anonymization",
 )
 
 # ── Models ─────────────────────────────────────────────────────
@@ -651,17 +651,17 @@ async def describe_epub_image(
     Uses Gemini → OpenAI fallback chain, or Qwen when anonymize=True.
     """
     system_prompt = (
-        "Jestes ekspertem od analizy obrazow w dokumentach. "
-        "Opisz dokladnie co przedstawia ten obraz.\n\n"
+        "Jesteś ekspertem od analizy obrazów w dokumentach. "
+        "Opisz dokładnie co przedstawia ten obraz.\n\n"
 
-        "Jesli obraz zawiera tabele:\n"
-        "- Jezeli cala tabela mozna przepisac w limicie tokenow, przepisz jej zawartosc w formacie Markdown.\n"
-        "- Jezeli tabela jest zbyt duza i przepisanie jej przekroczyloby limit tokenow, NIE przepisuj jej. "
-        "Zamiast tego opisz jej strukture, glowne kolumny, typ danych oraz kontekst.\n\n"
+        "Jeśli obraz zawiera tabele:\n"
+        "- Jeżeli całą tabelę można przepisać w limicie tokenów, przepisz jej zawartość w formacie Markdown.\n"
+        "- Jeżeli tabela jest zbyt duża i przepisanie jej przekroczyłoby limit tokenów, NIE przepisuj jej. "
+        "Zamiast tego opisz jej strukturę, główne kolumny, typ danych oraz kontekst.\n\n"
 
-        "Jesli to wykres, diagram, schemat lub zdjecie — opisz jego zawartosc i kontekst.\n\n"
+        "Jeśli to wykres, diagram, schemat lub zdjęcie — opisz jego zawartość i kontekst.\n\n"
 
-        f"Odpowiedz WYLACZNIE JSON (maksymalnie {image_desc_tokens} tokenow opisu):\n"
+        f"Odpowiedz WYŁĄCZNIE JSON (maksymalnie {image_desc_tokens} tokenów opisu):\n"
         '{"type": "photo|chart|diagram|table|schema|logo|illustration|other", "description": "..."}'
     )
 
@@ -727,7 +727,7 @@ async def _describe_image_with_retry(
     return {"type": "unknown", "description": "[DESCRIPTION ERROR]"}
 
 # ══════════════════════════════════════════════════════════════
-# PII Anonymization — tag sensitive data via Qwen
+# PII (Personally Identifiable Information) Anonymization — tag sensitive data via Qwen
 # ══════════════════════════════════════════════════════════════
 
 ANONYMIZE_SYSTEM_PROMPT = (
@@ -795,7 +795,7 @@ def _split_text_for_anonymization(text: str, max_chars: int = ANONYMIZE_MAX_CHAR
 
 
 async def _anonymize_text_chunk(text: str, qwen_api_key: Optional[str] = None) -> str:
-    """Call Qwen to tag PII in a single text chunk."""
+    """Call Qwen to tag personally identifiable information in a single text chunk."""
     messages = [
         {"role": "system", "content": ANONYMIZE_SYSTEM_PROMPT},
         {"role": "user", "content": text},
@@ -803,7 +803,7 @@ async def _anonymize_text_chunk(text: str, qwen_api_key: Optional[str] = None) -
 
     result = await _call_vision_with_fallback(
         messages=messages,
-        max_tokens=16000,
+        max_tokens=20000,
         temperature=0,
         force_qwen=True,
         qwen_api_key=qwen_api_key,
@@ -1201,7 +1201,7 @@ async def ocr_worker_process(job: OcrJobRequest):
                     num_images_detected = len(r["result"].get("images", []))
                     total_output_tokens += page_output_est + (num_images_detected * EST_OUTPUT_TOKENS_PER_IMAGE_DESC)
 
-                    # ── PII anonymization (sequential, one page at a time) ──
+                    # ── Anonymize personally identifiable information (sequential) ──
                     if job.anonymize and text:
                         text = await anonymize_text(
                             text,
@@ -1216,17 +1216,18 @@ async def ocr_worker_process(job: OcrJobRequest):
 
                     for img_idx, img_info in enumerate(r["result"].get("images", [])):
                         crop_filename = cropped[img_idx] if img_idx < len(cropped) else None
-                        img_description = (
-                            f"[Image: {img_info.get('type', 'unknown')}, "
-                            f"page {page_num}] {img_info.get('description', '')}"
-                        )
-                        # Anonymize image description
-                        if job.anonymize and img_description:
-                            img_description = await anonymize_text(
-                                img_description,
+                        raw_img_desc = img_info.get('description', '')
+                        # Anonymize only the AI-generated description
+                        if job.anonymize and raw_img_desc:
+                            raw_img_desc = await anonymize_text(
+                                raw_img_desc,
                                 context=f"page {page_num} img {img_idx}",
                                 qwen_api_key=job.qwen_api_key,
                             )
+                        img_description = (
+                            f"[Image: {img_info.get('type', 'unknown')}, "
+                            f"page {page_num}] {raw_img_desc}"
+                        )
                         img_entry = {
                             "description": img_description,
                             "section_context": text[:1000] if text else "",
@@ -2053,17 +2054,18 @@ async def epub_worker_process(job: EpubExtractRequest):
 
             for r in results:
                 images_done += 1
+                raw_img_desc = r['description'].get('description', r['alt'])
+                # Anonymize only the AI-generated description
+                if job.anonymize and raw_img_desc:
+                    raw_img_desc = await anonymize_text(
+                        raw_img_desc,
+                        context=f"epub img {r['idx']}",
+                    )
                 img_description = (
                     f"[Image: {r['description'].get('type', 'unknown')}, "
                     f"chapter {r['chapter_idx']}] "
-                    f"{r['description'].get('description', r['alt'])}"
+                    f"{raw_img_desc}"
                 )
-                # Anonymize image description
-                if job.anonymize and img_description:
-                    img_description = await anonymize_text(
-                        img_description,
-                        context=f"epub img {r['idx']}",
-                    )
                 img_entry = {
                     "description": img_description,
                     "section_context": "",
