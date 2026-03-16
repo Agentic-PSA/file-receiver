@@ -924,6 +924,7 @@ async def ocr_worker_process(job: OcrJobRequest):
             pages_dir.mkdir(parents=True, exist_ok=True)
 
         # ── Step 4: Rasterise and OCR in chunks ────────────────────────────────
+        file_receiver_base = os.getenv("FILE_RECEIVER_URL", "https://file-receiver.agentic.pl").rstrip("/")
         for chunk_start_0 in range(0, total_pages, PDF_CHUNK_SIZE):
             chunk_end_0 = min(chunk_start_0 + PDF_CHUNK_SIZE, total_pages)
 
@@ -1060,7 +1061,7 @@ async def ocr_worker_process(job: OcrJobRequest):
                         }
                         if crop_filename:
                             img_entry["image_url"] = (
-                                f"/files/{tenant_slug}/{job.knowledge_base_id}/"
+                                f"{file_receiver_base}/files/{tenant_slug}/{job.knowledge_base_id}/"
                                 f"{job.file_id or 'unknown'}/_images/{crop_filename}"
                             )
                         with open(images_jsonl, "a", encoding="utf-8") as fh:
@@ -1125,7 +1126,6 @@ async def ocr_worker_process(job: OcrJobRequest):
         images_jsonl.unlink(missing_ok=True)
 
         # ── Step 6: Lightweight callback — URL reference only ─────────────────
-        file_receiver_base = os.getenv("FILE_RECEIVER_URL", "https://file-receiver.agentic.pl").rstrip("/")
         ocr_result_url = (
             f"{file_receiver_base}/files/{tenant_slug}/"
             f"{job.knowledge_base_id}/{job.file_id or 'unknown'}/_ocr_result.json"
