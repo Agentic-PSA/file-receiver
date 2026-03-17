@@ -510,18 +510,21 @@ async def _call_vision_with_fallback(
         for attempt in range(provider["max_retries"] + 1):
             try:
                 async with httpx.AsyncClient(timeout=120) as client:
+                    body = {
+                        "model": provider["model"],
+                        "messages": messages,
+                        "max_tokens": max_tokens,
+                        "temperature": temperature,
+                    }
+                    if provider["name"] == "Qwen":
+                        body["chat_template_kwargs"] = {"enable_thinking": False}
                     resp = await client.post(
                         provider["url"],
                         headers={
                             "Content-Type": "application/json",
                             "Authorization": f"Bearer {provider['key']}",
                         },
-                        json={
-                            "model": provider["model"],
-                            "messages": messages,
-                            "max_tokens": max_tokens,
-                            "temperature": temperature,
-                        },
+                        json=body,
                     )
 
                     if resp.status_code == 200:
