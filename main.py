@@ -80,7 +80,7 @@ GEMINI_MODEL = "gemini-2.5-flash"
 OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = "gpt-4o-mini"
-QWEN_API_URL = "https://172.16.10.119:8010/v1/chat/completions"
+QWEN_API_URL = "http://172.16.10.119:8010/v1/chat/completions"
 QWEN_API_KEY = os.getenv("QWEN_API_KEY", "")
 QWEN_MODEL = "Qwen/Qwen2.5-VL-7B-Instruct"
 
