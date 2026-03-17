@@ -82,7 +82,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = "gpt-4o-mini"
 QWEN_API_URL = "http://172.16.10.119:8010/v1/chat/completions"
 QWEN_API_KEY = os.getenv("QWEN_API_KEY", "")
-QWEN_MODEL = "Qwen/Qwen2.5-VL-7B-Instruct"
+QWEN_MODEL = "Qwen/Qwen3.5-9B"
 
 # OCR Worker config
 # Number of pages rasterised from disk to RAM at once — keeps peak RAM ~130 MB
