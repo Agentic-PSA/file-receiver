@@ -588,38 +588,29 @@ async def ocr_call_gemini(
 ) -> Dict[str, Any]:
     """Call Vision API for a single page image OCR with Gemini→OpenAI fallback."""
     if extract_images:
-        system_prompt = """Jestes ekspertem od ekstrakcji tresci z dokumentow. Wykonaj DWA zadania:
-1. EKSTRAKCJA TEKSTU: Przepisz dokladnie CALY tekst w Markdown, zachowujac WSZELKIE wizualne formatowanie istotne dla znaczenia.
-2. DETEKCJA OBRAZOW: Zidentyfikuj elementy graficzne (zdjecia, wykresy, diagramy, schematy, logo, ilustracje techniczne, pieczatki, podpisy odręczne). NIE oznaczaj tabel, naglowkow, stopek ani dekoracji jako obrazy.
+        system_prompt = """Jestes ekspertem od ekstrakcji tresci z dokumentow. Wykonaj DWA zadania w JEDNYM przebiegu:
+1. PELNY HTML STRONY: Odtwórz calą zawartosc strony jako kompletny HTML. Uzyj natywnych tagow HTML do wiernego oddania struktury i formatowania:
+   - Naglowki: <h1>, <h2>, <h3> itd.
+   - Akapity: <p>
+   - Listy: <ul>/<ol> z <li>
+   - Tabele: <table>, <thead>, <tbody>, <tr>, <th>, <td>
+   - Pogrubienie: <b> lub <strong>
+   - Kursywa: <i> lub <em>
+   - Skreslenia (przekreslony tekst, linia przez srodek): <del>tekst</del>
+   - Podkreslenia: <u>tekst</u>
+   - Kolorowy tekst: <span style="color:red">tekst</span> (uzywaj nazwy koloru widocznego na stronie)
+   - Podswietlenie/highlight: <mark>tekst</mark> lub <mark style="background:yellow">tekst</mark>
+   - Indeksy: <sup>, <sub>
+   - Kombinacje formatowan zagniezdzaj: <del><span style="color:red">tekst</span></del>
  
-KRYTYCZNE ZASADY ZACHOWANIA FORMATOWANIA WIZUALNEGO:
-Musisz rozpoznawac i zachowywac w tekscie WSZELKIE formy wizualnego formatowania uzywajac tagow HTML:
-- SKRESLENIA (przekreslony tekst, linia przez srodek): <del>tekst</del>. Dotyczy cen, nazw, wartosci — wszystkiego co jest skreslone.
-- PODKRESLENIA: <u>tekst</u>.
-- POGRUBIENIE: <b>tekst</b>.
-- KURSYWA: <i>tekst</i>.
-- KOLOROWY TEKST (czerwony, zielony, niebieski itp.): <span style="color:red">tekst</span> — uzywaj nazwy koloru widocznego na stronie.
-- PODSWIETLENIE / ZAZNACZENIE (highlight, tlo za tekstem): <mark>tekst</mark>. Jesli kolor tla jest istotny: <mark style="background:yellow">tekst</mark>.
-- INDEKS GORNY: <sup>tekst</sup>. INDEKS DOLNY: <sub>tekst</sub>.
-- KOMBINACJE: jezeli tekst ma wiele formatowan jednoczesnie (np. skreslony i czerwony), zagniezdzaj tagi: <del><span style="color:red">tekst</span></del>.
-- Gdy formatowanie niesie znaczenie semantyczne (np. skreslona cena = nieaktualna), mozesz dopisac krotki kontekst w nawiasie: (cena skreslona), (wyroznienie), (uwaga).
+WAZNE ZASADY:
+- Przepisz CALY tekst — nie streszczaj, nie upraszczaj, nie pomijaj wierszy tabel.
+- Zachowaj dokladnie wszystkie wartosci liczbowe, ceny, jednostki.
+- W tabelach zachowaj powiazanie produktu/wariantu z etykieta ceny i wartoscia.
+- SKRESLENIA: jesli przez tekst/liczbe przechodzi linia (nawet cienka, szara, subtelna) — oznacz <del>. Dotyczy cen katalogowych, starych wartosci, wykreslonych pozycji. Cenniki czesto maja 'cene katalogowa' skreslona obok nizszej 'ceny specjalnej'. Sprawdz KAZDY wiersz tabeli pod katem skreslenia.
+- Nie zwracaj Markdown — zwracaj HTML.
  
-SPECJALNA INSTRUKCJA — AKTYWNE WYKRYWANIE SKREŚLEŃ W CENNIKACH I TABELACH:
-Cenniki, broszury produktowe i oferty czesto zawieraja 'ceny katalogowe' (stare ceny) z linia przez srodek obok 'cen specjalnych' (nowych, nizszych cen).
-Dla KAZDEGO wiersza tabeli z cenami:
-  1. Sprawdz czy KTORYKOLWIEK tekst/liczba ma linie pozioma przechodzaca przez srodek — to skreslenie.
-  2. Skreslenie moze byc subtelne: cienka linia, szara linia, linia w kolorze tekstu.
-  3. Jesli widzisz wiersz z etykieta 'cena katalogowa' i oddzielna 'cena specjalna' — cena katalogowa jest PRAWIE ZAWSZE skreslona wizualnie. Sprawdz uwaznie.
-  4. KAZDA skreslona wartosc MUSI byc otagowana <del>wartosc</del> — nie pomijaj zadnej.
-  5. Typowy wzorzec w cennikach: cena katalogowa <del>123 900 PLN</del>, cena specjalna 112 100 PLN.
-  6. Skreslenia wystepuja rowniez w cenach akcesoriow i opcji dodatkowych — przegladaj KAZDY wiersz.
- 
-ZASADY DLA TABEL I STRUKTUR:
-- W tabelach zachowaj relacje wiersz-kolumna; nie odrywaj cen od produktu, wariantu ani etykiety typu 'cena katalogowa' / 'cena specjalna'.
-- Jezeli jedna pozycja ma kilka cen lub statusow, przypisz kazda wartosc do wlasciwej etykiety.
-- Zachowaj doslowne wartosci typu 'WYPRZEDANE', '0 PLN', '-', 'bez doplaty'.
-- Nie normalizuj ani nie upraszczaj ukladu tak, aby zniknela informacja o formatowaniu.
-- Jezeli strona zawiera tabele, odtworz je jako tabele Markdown lub bardzo czytelne wiersze z kolumnami.
+2. DETEKCJA OBRAZOW: Zidentyfikuj elementy graficzne (zdjecia, wykresy, diagramy, schematy, logo, ilustracje techniczne, pieczatki, podpisy odreczne). NIE oznaczaj tabel, naglowkow, stopek ani dekoracji jako obrazy.
  
 Dla kazdego obrazu podaj typ, opis (max {image_desc_tokens} tokenow) oraz wspolrzedne bbox jako [y_min, x_min, y_max, x_max] w skali 0-1000 (0,0 = lewy gorny rog, 1000,1000 = prawy dolny rog).
  
@@ -629,50 +620,46 @@ Krok 2: Znajdz skrajne punkty: najwyzszy piksel (y_min), najnizszy (y_max), najb
 Krok 3: Dodaj margines bezpieczenstwa ~8% rozmiaru obrazu w kazdym kierunku.
 Krok 4: Sprawdz czy bbox nie ucina zadnej czesci — jesli masz watpliwosci, POWIEKSZ bbox.
  
-KRYTYCZNE ZASADY:
+KRYTYCZNE ZASADY BBOX:
 - Bbox MUSI objac CALY obraz lacznie z podpisami, etykietami, legendami i ramkami.
-- ZAWSZE lepiej podac bbox WIEKSZY niz za maly — uciety obraz jest bezuzyteczny.
-- Jezeli obraz ma tlo (np. biale tlo zdjecia produktu), bbox musi objac CALE tlo.
-- Dla zdjec produktow/samochodow/osob: obejmij caly obiekt lacznie z cieniem i odbiciem.
+- ZAWSZE lepiej podac bbox WIEKSZY niz za maly.
+- Dla zdjec produktow: obejmij caly obiekt lacznie z cieniem i odbiciem.
 - Dla wykresow: obejmij osie, etykiety osi, legende i tytul wykresu.
-- Jezeli obraz rozciaga sie na wieksza czesc strony, bbox powinien to odzwierciedlac.
+- NIE grupuj kilku oddzielnych obrazow w jeden bbox — kazdy obraz osobno.
 - Pusta lista jesli brak obrazow.
  
-TYPOWE BLEDY DO UNIKANIA:
-- NIE obcinaj dolnej krawedzi obrazu (najczestszy blad).
-- NIE obcinaj prawej krawedzi — sprawdz czy caly obiekt miesci sie w bbox.
-- NIE grupuj kilku oddzielnych obrazow w jeden bbox — kazdy obraz osobno.
- 
 Odpowiedz WYLACZNIE JSON:
-{"text": "...", "images": [{"type": "...", "description": "...", "bbox": [y_min, x_min, y_max, x_max]}]}"""
+{"text": "<h2>Tytul</h2><table>...</table><p>tekst z <del>skresleniem</del></p>", "images": [{"type": "...", "description": "...", "bbox": [y_min, x_min, y_max, x_max]}]}"""
     else:
-        system_prompt = """Przepisz dokladnie caly tekst widoczny na tym obrazie strony dokumentu. Zachowaj oryginalna strukture: naglowki, akapity, punkty, tabele w formacie Markdown.
+        system_prompt = """Przepisz dokladnie caly tekst widoczny na tym obrazie strony dokumentu jako pelny HTML. NIE uzywaj Markdown — zwracaj HTML.
  
-ZACHOWAJ WSZELKIE FORMATOWANIE WIZUALNE W TAGACH HTML:
+Uzyj natywnych tagow HTML:
+- Naglowki: <h1>, <h2>, <h3>
+- Akapity: <p>
+- Listy: <ul>/<ol> z <li>
+- Tabele: <table>, <thead>, <tbody>, <tr>, <th>, <td>
+- Pogrubienie: <b>, Kursywa: <i>
 - Skreslenia: <del>tekst</del>
 - Podkreslenia: <u>tekst</u>
-- Pogrubienie: <b>tekst</b>
-- Kursywa: <i>tekst</i>
 - Kolorowy tekst: <span style="color:nazwa">tekst</span>
-- Podswietlenie/highlight: <mark>tekst</mark>
-- Indeksy: <sup>tekst</sup>, <sub>tekst</sub>
+- Podswietlenie: <mark>tekst</mark>
+- Indeksy: <sup>, <sub>
 - Kombinacje formatowan zagniezdzaj w tagach.
  
-SPECJALNA INSTRUKCJA — AKTYWNE WYKRYWANIE SKREŚLEŃ:
-W cennikach i broszurach 'cena katalogowa' jest czesto skreslona (linia przez srodek), a obok niej podana jest nizsza 'cena specjalna'.
-Przejrzyj KAZDY wiersz tabeli — jesli jakakolwiek wartosc (cena, tekst) ma linie przechodzaca przez srodek, MUSISZ otagowac ja <del>wartosc</del>.
-Skreslenie moze byc subtelne (cienka/szara linia). Nie pomijaj zadnego skreslenia.
+WAZNE ZASADY:
+- Przepisz CALY tekst — nie streszczaj, nie pomijaj wierszy.
+- Zachowaj wartosci liczbowe, ceny, jednostki dokladnie.
+- W tabelach zachowaj powiazanie produktu z cenami.
+- SKRESLENIA: jesli przez tekst przechodzi linia (nawet cienka/szara) — oznacz <del>. Cenniki czesto maja skreslone 'ceny katalogowe' obok nizszych 'cen specjalnych'. Sprawdz KAZDY wiersz tabeli.
  
-W tabelach zachowaj powiazanie produktu, etykiety ceny i wartosci; nie gub informacji o formatowaniu wynikajacej z ukladu wizualnego.
- 
-Odpowiedz WYLACZNIE JSON: {"text": "wyekstrahowany tekst..."}"""
+Odpowiedz WYLACZNIE JSON: {"text": "<h2>Tytul</h2><p>tekst z <del>skresleniem</del></p>"}"""
 
     messages = [
         {"role": "system", "content": system_prompt},
         {
             "role": "user",
             "content": [
-                {"type": "text", "text": "Przeanalizuj te strone dokumentu:"},
+                {"type": "text", "text": "Przeanalizuj te strone dokumentu. Odtwórz pelna zawartosc strony w HTML z zachowaniem wszystkich stylowan wizualnych (skreslenia, kolory, podkreslenia, pogrubienia)."},
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}},
             ],
         },
