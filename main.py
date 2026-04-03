@@ -588,24 +588,68 @@ async def ocr_call_gemini(
 ) -> Dict[str, Any]:
     """Call Vision API for a single page image OCR with Gemini→OpenAI fallback."""
     if extract_images:
-        system_prompt = (
-            "Jesteś ekspertem od ekstrakcji treści z dokumentów. Wykonaj DWA zadania:\n"
-            "1. EKSTRAKCJA TEKSTU: Przepisz dokładnie CAŁY tekst w Markdown.\n"
-            "2. DETEKCJA OBRAZÓW: Zidentyfikuj elementy graficzne (zdjęcia, wykresy, diagramy, schematy, logo). "
-            "NIE oznaczaj tabel, nagłówków, stopek ani dekoracji jako obrazy.\n"
-            f"Dla każdego obrazu podaj typ, opis (max {image_desc_tokens} tokenów) "
-            "oraz współrzędne bbox jako [y_min, x_min, y_max, x_max] w skali 0-1000 "
-            "(0,0 = lewy górny róg, 1000,1000 = prawy dolny róg). "
-            "Pusta lista jeśli brak obrazów.\n\n"
-            'Odpowiedz WYŁĄCZNIE JSON:\n'
-            '{"text": "...", "images": [{"type": "...", "description": "...", "bbox": [y_min, x_min, y_max, x_max]}]}'
-        )
+        system_prompt = """Jestes ekspertem od ekstrakcji tresci z dokumentow. Wykonaj DWA zadania:
+1. EKSTRAKCJA TEKSTU: Przepisz dokladnie CALY tekst w Markdown, zachowujac WSZELKIE wizualne formatowanie istotne dla znaczenia.
+2. DETEKCJA OBRAZOW: Zidentyfikuj elementy graficzne (zdjecia, wykresy, diagramy, schematy, logo, ilustracje techniczne, pieczatki, podpisy odręczne). NIE oznaczaj tabel, naglowkow, stopek ani dekoracji jako obrazy.
+ 
+KRYTYCZNE ZASADY ZACHOWANIA FORMATOWANIA WIZUALNEGO:
+Musisz rozpoznawac i zachowywac w tekscie WSZELKIE formy wizualnego formatowania uzywajac tagow HTML:
+- SKRESLENIA (przekreslony tekst, linia przez srodek): <del>tekst</del>. Dotyczy cen, nazw, wartosci — wszystkiego co jest skreslone.
+- PODKRESLENIA: <u>tekst</u>.
+- POGRUBIENIE: <b>tekst</b>.
+- KURSYWA: <i>tekst</i>.
+- KOLOROWY TEKST (czerwony, zielony, niebieski itp.): <span style="color:red">tekst</span> — uzywaj nazwy koloru widocznego na stronie.
+- PODSWIETLENIE / ZAZNACZENIE (highlight, tlo za tekstem): <mark>tekst</mark>. Jesli kolor tla jest istotny: <mark style="background:yellow">tekst</mark>.
+- INDEKS GORNY: <sup>tekst</sup>. INDEKS DOLNY: <sub>tekst</sub>.
+- KOMBINACJE: jezeli tekst ma wiele formatowan jednoczesnie (np. skreslony i czerwony), zagniezdzaj tagi: <del><span style="color:red">tekst</span></del>.
+- Gdy formatowanie niesie znaczenie semantyczne (np. skreslona cena = nieaktualna), mozesz dopisac krotki kontekst w nawiasie: (cena skreslona), (wyroznienie), (uwaga).
+ 
+ZASADY DLA TABEL I STRUKTUR:
+- W tabelach zachowaj relacje wiersz-kolumna; nie odrywaj cen od produktu, wariantu ani etykiety typu 'cena katalogowa' / 'cena specjalna'.
+- Jezeli jedna pozycja ma kilka cen lub statusow, przypisz kazda wartosc do wlasciwej etykiety.
+- Zachowaj doslowne wartosci typu 'WYPRZEDANE', '0 PLN', '-', 'bez doplaty'.
+- Nie normalizuj ani nie upraszczaj ukladu tak, aby zniknela informacja o formatowaniu.
+- Jezeli strona zawiera tabele, odtworz je jako tabele Markdown lub bardzo czytelne wiersze z kolumnami.
+ 
+Dla kazdego obrazu podaj typ, opis (max {image_desc_tokens} tokenow) oraz wspolrzedne bbox jako [y_min, x_min, y_max, x_max] w skali 0-1000 (0,0 = lewy gorny rog, 1000,1000 = prawy dolny rog).
+ 
+INSTRUKCJA PRECYZYJNEJ LOKALIZACJI BBOX:
+Krok 1: Zidentyfikuj WSZYSTKIE piksele nalezace do obrazu — wlacznie z cieniami, ramkami, tlem obrazu i podpisami.
+Krok 2: Znajdz skrajne punkty: najwyzszy piksel (y_min), najnizszy (y_max), najbardziej lewy (x_min), najbardziej prawy (x_max).
+Krok 3: Dodaj margines bezpieczenstwa ~8% rozmiaru obrazu w kazdym kierunku.
+Krok 4: Sprawdz czy bbox nie ucina zadnej czesci — jesli masz watpliwosci, POWIEKSZ bbox.
+ 
+KRYTYCZNE ZASADY:
+- Bbox MUSI objac CALY obraz lacznie z podpisami, etykietami, legendami i ramkami.
+- ZAWSZE lepiej podac bbox WIEKSZY niz za maly — uciety obraz jest bezuzyteczny.
+- Jezeli obraz ma tlo (np. biale tlo zdjecia produktu), bbox musi objac CALE tlo.
+- Dla zdjec produktow/samochodow/osob: obejmij caly obiekt lacznie z cieniem i odbiciem.
+- Dla wykresow: obejmij osie, etykiety osi, legende i tytul wykresu.
+- Jezeli obraz rozciaga sie na wieksza czesc strony, bbox powinien to odzwierciedlac.
+- Pusta lista jesli brak obrazow.
+ 
+TYPOWE BLEDY DO UNIKANIA:
+- NIE obcinaj dolnej krawedzi obrazu (najczestszy blad).
+- NIE obcinaj prawej krawedzi — sprawdz czy caly obiekt miesci sie w bbox.
+- NIE grupuj kilku oddzielnych obrazow w jeden bbox — kazdy obraz osobno.
+ 
+Odpowiedz WYLACZNIE JSON:
+{"text": "...", "images": [{"type": "...", "description": "...", "bbox": [y_min, x_min, y_max, x_max]}]}"""
     else:
-        system_prompt = (
-            "Przepisz dokładnie cały tekst widoczny na tym obrazie strony dokumentu. "
-            "Zachowaj oryginalną strukturę: nagłówki, akapity, punkty, tabele w formacie Markdown.\n\n"
-            'Odpowiedz WYŁĄCZNIE JSON: {"text": "wyekstrahowany tekst..."}'
-        )
+        system_prompt = """Przepisz dokladnie caly tekst widoczny na tym obrazie strony dokumentu. Zachowaj oryginalna strukture: naglowki, akapity, punkty, tabele w formacie Markdown.
+ 
+ZACHOWAJ WSZELKIE FORMATOWANIE WIZUALNE W TAGACH HTML:
+- Skreslenia: <del>tekst</del>
+- Podkreslenia: <u>tekst</u>
+- Pogrubienie: <b>tekst</b>
+- Kursywa: <i>tekst</i>
+- Kolorowy tekst: <span style="color:nazwa">tekst</span>
+- Podswietlenie/highlight: <mark>tekst</mark>
+- Indeksy: <sup>tekst</sup>, <sub>tekst</sub>
+- Kombinacje formatowan zagniezdzaj w tagach.
+W tabelach zachowaj powiazanie produktu, etykiety ceny i wartosci; nie gub informacji o formatowaniu wynikajacej z ukladu wizualnego.
+ 
+Odpowiedz WYLACZNIE JSON: {"text": "wyekstrahowany tekst..."}"""
 
     messages = [
         {"role": "system", "content": system_prompt},
