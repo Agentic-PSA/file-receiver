@@ -604,6 +604,16 @@ Musisz rozpoznawac i zachowywac w tekscie WSZELKIE formy wizualnego formatowania
 - KOMBINACJE: jezeli tekst ma wiele formatowan jednoczesnie (np. skreslony i czerwony), zagniezdzaj tagi: <del><span style="color:red">tekst</span></del>.
 - Gdy formatowanie niesie znaczenie semantyczne (np. skreslona cena = nieaktualna), mozesz dopisac krotki kontekst w nawiasie: (cena skreslona), (wyroznienie), (uwaga).
  
+SPECJALNA INSTRUKCJA — AKTYWNE WYKRYWANIE SKREŚLEŃ W CENNIKACH I TABELACH:
+Cenniki, broszury produktowe i oferty czesto zawieraja 'ceny katalogowe' (stare ceny) z linia przez srodek obok 'cen specjalnych' (nowych, nizszych cen).
+Dla KAZDEGO wiersza tabeli z cenami:
+  1. Sprawdz czy KTORYKOLWIEK tekst/liczba ma linie pozioma przechodzaca przez srodek — to skreslenie.
+  2. Skreslenie moze byc subtelne: cienka linia, szara linia, linia w kolorze tekstu.
+  3. Jesli widzisz wiersz z etykieta 'cena katalogowa' i oddzielna 'cena specjalna' — cena katalogowa jest PRAWIE ZAWSZE skreslona wizualnie. Sprawdz uwaznie.
+  4. KAZDA skreslona wartosc MUSI byc otagowana <del>wartosc</del> — nie pomijaj zadnej.
+  5. Typowy wzorzec w cennikach: cena katalogowa <del>123 900 PLN</del>, cena specjalna 112 100 PLN.
+  6. Skreslenia wystepuja rowniez w cenach akcesoriow i opcji dodatkowych — przegladaj KAZDY wiersz.
+ 
 ZASADY DLA TABEL I STRUKTUR:
 - W tabelach zachowaj relacje wiersz-kolumna; nie odrywaj cen od produktu, wariantu ani etykiety typu 'cena katalogowa' / 'cena specjalna'.
 - Jezeli jedna pozycja ma kilka cen lub statusow, przypisz kazda wartosc do wlasciwej etykiety.
@@ -647,6 +657,12 @@ ZACHOWAJ WSZELKIE FORMATOWANIE WIZUALNE W TAGACH HTML:
 - Podswietlenie/highlight: <mark>tekst</mark>
 - Indeksy: <sup>tekst</sup>, <sub>tekst</sub>
 - Kombinacje formatowan zagniezdzaj w tagach.
+ 
+SPECJALNA INSTRUKCJA — AKTYWNE WYKRYWANIE SKREŚLEŃ:
+W cennikach i broszurach 'cena katalogowa' jest czesto skreslona (linia przez srodek), a obok niej podana jest nizsza 'cena specjalna'.
+Przejrzyj KAZDY wiersz tabeli — jesli jakakolwiek wartosc (cena, tekst) ma linie przechodzaca przez srodek, MUSISZ otagowac ja <del>wartosc</del>.
+Skreslenie moze byc subtelne (cienka/szara linia). Nie pomijaj zadnego skreslenia.
+ 
 W tabelach zachowaj powiazanie produktu, etykiety ceny i wartosci; nie gub informacji o formatowaniu wynikajacej z ukladu wizualnego.
  
 Odpowiedz WYLACZNIE JSON: {"text": "wyekstrahowany tekst..."}"""
