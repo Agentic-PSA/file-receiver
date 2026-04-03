@@ -84,6 +84,9 @@ QWEN_API_URL = "http://172.16.10.119:8010/v1/chat/completions"
 QWEN_API_KEY = os.getenv("QWEN_API_KEY", "")
 QWEN_MODEL = "Qwen/Qwen3.5-9B"
 
+# Anonymization service
+ANONYMIZE_API_URL = os.getenv("ANONYMIZE_API_URL", "http://172.16.10.24:30876/api/process-text")
+
 # OCR Worker config
 # Number of pages rasterised from disk to RAM at once — keeps peak RAM ~130 MB
 # regardless of total document length (e.g. 2000 pages @ 150 DPI ≈ 13 GB without chunking)
@@ -777,106 +780,8 @@ async def _describe_image_with_retry(
     return {"type": "unknown", "description": "[DESCRIPTION ERROR]"}
 
 # ══════════════════════════════════════════════════════════════
-# PII (Personally Identifiable Information) Anonymization — tag sensitive data via Qwen
+# PII (Personally Identifiable Information) Anonymization — external anonymization service
 # ══════════════════════════════════════════════════════════════
-
-ANONYMIZE_SYSTEM_PROMPT = (
-    "Jesteś ekspertem od ochrony danych osobowych i danych firmowych. Twoim zadaniem jest oznaczenie "
-    "danych wrażliwych w tekście za pomocą tagów XML.\n\n"
-
-    "Oznaczaj dane osób fizycznych, firm, instytucji publicznych oraz organizacji.\n"
-    "Uwzględniaj dane występujące w nagłówkach, stopkach, podpisach, tabelach oraz treści głównej.\n\n"
-
-    "Kategorie danych do oznaczenia:\n"
-    "- <first_name>...</first_name> — imię osoby fizycznej\n"
-    "- <last_name>...</last_name> — nazwisko osoby fizycznej\n"
-    "- <company>...</company> — nazwa firmy, organizacji lub instytucji\n"
-    "- <email>...</email> — adres email osoby lub firmy\n"
-    "- <phone>...</phone> — numer telefonu osoby lub firmy\n"
-    "- <nip>...</nip> — numer NIP firmy\n"
-    "- <regon>...</regon> — numer REGON firmy\n"
-    "- <krs>...</krs> — numer KRS\n"
-    "- <address>...</address> — adres (ulica, numer, lokal, kod pocztowy, miasto)\n"
-    "- <account>...</account> — numer rachunku bankowego (IBAN lub NRB)\n"
-    "- <pesel>...</pesel> — numer PESEL\n"
-    "- <document>...</document> — numer lub nazwa dokumentu (np. dowód osobisty, paszport, numer sprawy jeśli zawiera dane osobowe)\n\n"
-
-    "DANE OSÓB:\n"
-    "Oznacz imię i nazwisko nawet jeśli:\n"
-    "- występują w podpisie\n"
-    "- występują po frazie 'Sprawę prowadzi'\n"
-    "- występują po słowach: Zobowiązany, Dłużnik, Wierzyciel, Pełnomocnik, Podpis\n"
-    "- są częścią jednoosobowej działalności gospodarczej\n"
-    "- występują w tabeli\n\n"
-
-    "DANE FIRM I ORGANIZACJI:\n"
-    "Oznacz nazwy firm oraz instytucji, szczególnie gdy zawierają formę prawną:\n"
-    "Sp. z o.o., Sp z o.o., S.A., SA, Sp.k., Spółka komandytowa, Spółka akcyjna,\n"
-    "Spółka jawna, Spółka cywilna, Fundacja, Stowarzyszenie, Instytut, Uniwersytet,\n"
-    "Szpital, Bank, Urząd, Ministerstwo, Gmina, Miasto, Powiat, Województwo, Szkoła, Akademia.\n\n"
-
-    "Jednoosobowa działalność gospodarcza może mieć nazwę w formacie:\n"
-    "Imię Nazwisko Usługi\n"
-    "Imię Nazwisko Consulting\n"
-    "Imię Nazwisko IT\n\n"
-
-    "RELACJE:\n"
-    "Jeśli obok nazwy firmy występują dane takie jak NIP, REGON, KRS, adres lub konto bankowe,\n"
-    "oznacz wszystkie te elementy jako dane wrażliwe.\n\n"
-
-    "REGUŁY WYKRYWANIA:\n"
-    "Imię i nazwisko:\n"
-    "- dwa lub trzy wyrazy zaczynające się wielką literą\n"
-    "- np. Jan Kowalski, Anna Nowak, Maciej Librowski\n\n"
-
-    "Telefon:\n"
-    "- formaty polskie i międzynarodowe:\n"
-    "+48 123 456 789\n"
-    "+48123456789\n"
-    "123-456-789\n"
-    "(22) 123 45 67\n\n"
-
-    "Email:\n"
-    "- standardowy format tekst@domena.pl\n\n"
-
-    "Adres:\n"
-    "- ul. Nazwa 12\n"
-    "- al. Jana Pawła II 3\n"
-    "- Plac Bankowy 3/5\n"
-    "- 00-001 Warszawa\n\n"
-
-    "Konto bankowe:\n"
-    "- 26 cyfr\n"
-    "- IBAN np. PL61109010140000071219812874\n\n"
-
-    "Identyfikatory firm:\n"
-    "- NIP = 10 cyfr\n"
-    "- REGON = 9 lub 14 cyfr\n"
-    "- KRS = 10 cyfr\n\n"
-
-    "KONTEKST SZCZEGÓLNIE ISTOTNY:\n"
-    "Sprawę prowadzi\n"
-    "Zobowiązany\n"
-    "Dłużnik\n"
-    "Wierzyciel\n"
-    "Reprezentowany przez\n"
-    "Zarząd\n"
-    "Beneficjent\n"
-    "Wystawca\n"
-    "Nabywca\n"
-    "Organ egzekucyjny\n"
-    "Strona umowy\n"
-    "Adres siedziby\n\n"
-
-    "ZASADY:\n"
-    "1. Zwróć CAŁY tekst z oznaczonymi danymi wrażliwymi.\n"
-    "2. NIE zmieniaj żadnego innego tekstu — zachowaj dokładnie taką samą treść i formatowanie.\n"
-    "3. NIE dodawaj żadnych komentarzy, wyjaśnień ani dodatkowego tekstu.\n"
-    "4. Jeśli w tekście nie ma danych wrażliwych, zwróć go bez zmian.\n"
-    "5. Odpowiedz WYŁĄCZNIE tekstem z oznaczeniami, bez żadnych prefixów ani suffixów.\n"
-    "6. Jeśli masz wątpliwość czy dane są wrażliwe — oznacz je.\n"
-    "7. Oznaczaj dane także w tabelach i podpisach.\n"
-)
 
 # ~10 000 tokens ≈ ~40 000 chars (conservative 4 chars/token estimate)
 ANONYMIZE_MAX_CHARS = 40000
@@ -919,22 +824,21 @@ def _split_text_for_anonymization(text: str, max_chars: int = ANONYMIZE_MAX_CHAR
 
 
 async def _anonymize_text_chunk(text: str, qwen_api_key: Optional[str] = None) -> str:
-    """Call Qwen to tag personally identifiable information in a single text chunk."""
-    messages = [
-        {"role": "system", "content": ANONYMIZE_SYSTEM_PROMPT},
-        {"role": "user", "content": text},
-    ]
+    """Call the anonymization service to tag personally identifiable information in a single text chunk."""
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.post(
+            ANONYMIZE_API_URL,
+            headers={"Content-Type": "application/json"},
+            json={"text": text},
+        )
 
-    result = await _call_vision_with_fallback(
-        messages=messages,
-        max_tokens=20000,
-        temperature=0,
-        force_qwen=True,
-        qwen_api_key=qwen_api_key,
-    )
+        if resp.status_code in (400, 401, 403):
+            raise NonRetryableAPIError(f"Anonymize API returned {resp.status_code}: {resp.text[:300]}")
 
-    content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-    return content.strip() if content else text
+        resp.raise_for_status()
+        data = resp.json()
+        tagged = data.get("tagged_text", "")
+        return tagged.strip() if tagged else text
 
 
 async def _anonymize_text_with_retry(
