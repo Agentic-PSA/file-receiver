@@ -102,7 +102,7 @@ epub_jobs: Dict[str, Dict[str, Any]] = {}
 
 app = FastAPI(
     title="BlueBox File Receiver",
-    version="4.8.0",
+    version="4.9.0",
     description="Tenant-isolated file storage + PDF-to-images + Background OCR Worker + Background EPUB extraction + Anonymization",
 )
 
@@ -1853,6 +1853,53 @@ async def list_tenant_kbs(
         "tenant_slug": tenant_slug,
         "knowledge_bases": kbs,
         "total": len(kbs),
+    }
+
+@app.delete("/files/{tenant_slug}")
+async def delete_tenant_data(
+    tenant_slug: str,
+    x_api_key: str = Header(...),
+    x_tenant: Optional[str] = Header(None),
+):
+    """
+    Delete ALL stored files for a tenant (entire tenant directory).
+    Intended to be called by a scheduled cleanup job after the 30-day
+    grace period for organization deletion has elapsed.
+    """
+    verify_api_key(x_api_key)
+    verify_tenant(tenant_slug, x_tenant)
+
+    tenant_path = Path(STORAGE_ROOT) / tenant_slug
+
+    if not tenant_path.exists():
+        raise HTTPException(status_code=404, detail="Tenant directory not found")
+
+    if not str(tenant_path.resolve()).startswith(str(Path(STORAGE_ROOT).resolve())):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    # Gather stats before deletion for the response
+    total_bytes = 0
+    file_count = 0
+    kb_count = 0
+    for kb_dir in tenant_path.iterdir():
+        if kb_dir.is_dir():
+            kb_count += 1
+            for doc_dir in kb_dir.iterdir():
+                if doc_dir.is_dir():
+                    for f in doc_dir.iterdir():
+                        if f.is_file():
+                            file_count += 1
+                            total_bytes += f.stat().st_size
+
+    shutil.rmtree(tenant_path)
+    logger.info(f"[cleanup] Deleted tenant '{tenant_slug}': {kb_count} KBs, {file_count} files, {total_bytes} bytes")
+
+    return {
+        "deleted": True,
+        "tenant_slug": tenant_slug,
+        "kb_count": kb_count,
+        "file_count": file_count,
+        "total_bytes_freed": total_bytes,
     }
 
 @app.get("/tenants/{tenant_slug}/stats")
