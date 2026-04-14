@@ -71,7 +71,7 @@ class NonRetryableAPIError(Exception):
 STORAGE_ROOT = os.getenv("STORAGE_ROOT", "/data/files")
 API_KEY = os.getenv("FILE_RECEIVER_API_KEY", "change-me-in-production")
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "500"))
-PDF_DPI = int(os.getenv("PDF_DPI", "150"))
+PDF_DPI = int(os.getenv("PDF_DPI", "200"))
 
 # AI Gateway for OCR
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
@@ -80,6 +80,8 @@ GEMINI_MODEL = "gemini-2.5-flash"
 OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = "gpt-4o-mini"
+LOVABLE_GW_URL = "https://ai-gateway.lovable.dev/v1/chat/completions"
+LOVABLE_GW_MODEL = "google/gemini-2.5-flash"
 QWEN_API_URL = "http://172.16.10.119:8010/v1/chat/completions"
 QWEN_API_KEY = os.getenv("QWEN_API_KEY", "")
 QWEN_MODEL = "Qwen/Qwen3.5-9B"
@@ -157,8 +159,8 @@ async def fetch_central_prompt(prompt_key: str) -> Optional[Dict[str, str]]:
 
 app = FastAPI(
     title="BlueBox File Receiver",
-    version="4.10.0",
-    description="Tenant-isolated file storage + PDF-to-images + Background OCR Worker + Background EPUB extraction + Anonymization",
+    version="4.11.0",
+    description="Tenant-isolated file storage + PDF-to-images + Background OCR Worker + Background EPUB extraction + Anonymization + Image Cropping",
 )
 
 # ── Models ─────────────────────────────────────────────────────
@@ -172,8 +174,8 @@ class FileStatus(str, Enum):
 class PdfToImagesRequest(BaseModel):
     """Request body for PDF-to-images conversion (base64)."""
     pdf_base64: str
-    dpi: int = 150
-    quality: int = 85
+    dpi: int = 200
+    quality: int = 92
     pages: Optional[str] = None  # "all", "1-5", "3"
 
 class OcrJobRequest(BaseModel):
@@ -519,10 +521,11 @@ async def _call_vision_with_fallback(
     temperature: float = 0,
     force_qwen: bool = False,
     qwen_api_key: Optional[str] = None,
+    lovable_api_key: Optional[str] = None,
 ) -> dict:
     """
     Call a vision-capable LLM with automatic fallback.
-    Provider chain: Qwen (if forced) → Gemini → OpenAI.
+    Provider chain: Qwen (if forced) → Gemini → OpenAI → Lovable AI Gateway.
     Returns the parsed JSON response from the API.
     Raises on total failure.
     """
@@ -552,6 +555,16 @@ async def _call_vision_with_fallback(
                 "key": OPENAI_API_KEY,
                 "model": OPENAI_MODEL,
                 "name": "OpenAI",
+                "max_retries": 2,
+            })
+        # Lovable AI Gateway as last-resort fallback
+        effective_lovable_key = lovable_api_key or os.getenv("LOVABLE_API_KEY", "")
+        if effective_lovable_key:
+            providers.append({
+                "url": LOVABLE_GW_URL,
+                "key": effective_lovable_key,
+                "model": LOVABLE_GW_MODEL,
+                "name": "LovableGW",
                 "max_retries": 2,
             })
 
@@ -645,23 +658,25 @@ async def ocr_call_gemini(
     image_desc_tokens: int = 200,
 ) -> Dict[str, Any]:
     """Call Vision API for a single page image OCR with Gemini→OpenAI fallback.
-    Tries to fetch prompts from the central ocr-prompts Edge Function first;
-    falls back to hardcoded prompts on failure."""
+    Fetches prompts from central ocr_prompts table; falls back to hardcoded if unavailable."""
 
-    # ── Try central prompts first ─────────────────────────────
-    prompt_key = "ocr_extract_images" if extract_images else "ocr_text_only"
+    # ── Try central prompt first ──
+    prompt_key = "ocr_html_images" if extract_images else "ocr_html"
     central = await fetch_central_prompt(prompt_key)
-
-    user_text = None  # default user message text
 
     if central and central.get("system_prompt"):
         system_prompt = central["system_prompt"]
-        # Allow the central prompt to override the user message as well
-        if central.get("user_prompt_template"):
-            user_text = central["user_prompt_template"]
-    elif extract_images:
-        # ── Fallback: hardcoded extract-images prompt ─────────
-        system_prompt = """Jestes ekspertem od ekstrakcji tresci z dokumentow. Wykonaj DWA zadania w JEDNYM przebiegu:
+        # Replace {{image_desc_tokens}} placeholder if present
+        system_prompt = system_prompt.replace("{{image_desc_tokens}}", str(image_desc_tokens))
+        user_text = central.get("user_prompt_template") or (
+            "Przeanalizuj te strone dokumentu. Odtwórz pelna zawartosc strony w HTML "
+            "z zachowaniem wszystkich stylowan wizualnych (skreslenia, kolory, podkreslenia, pogrubienia)."
+        )
+        logger.info(f"[ocr] Using central prompt: {prompt_key}")
+    else:
+        # ── Hardcoded fallback ──
+        if extract_images:
+            system_prompt = f"""Jestes ekspertem od ekstrakcji tresci z dokumentow. Wykonaj DWA zadania w JEDNYM przebiegu:
 1. PELNY HTML STRONY: Odtwórz calą zawartosc strony jako kompletny HTML. Uzyj natywnych tagow HTML do wiernego oddania struktury i formatowania:
    - Naglowki: <h1>, <h2>, <h3> itd.
    - Akapity: <p>
@@ -702,10 +717,9 @@ KRYTYCZNE ZASADY BBOX:
 - Pusta lista jesli brak obrazow.
  
 Odpowiedz WYLACZNIE JSON:
-{"text": "<h2>Tytul</h2><table>...</table><p>tekst z <del>skresleniem</del></p>", "images": [{"type": "...", "description": "...", "bbox": [y_min, x_min, y_max, x_max]}]}"""
-    else:
-        # ── Fallback: hardcoded text-only prompt ──────────────
-        system_prompt = """Przepisz dokladnie caly tekst widoczny na tym obrazie strony dokumentu jako pelny HTML. NIE uzywaj Markdown — zwracaj HTML.
+{{"text": "<h2>Tytul</h2><table>...</table><p>tekst z <del>skresleniem</del></p>", "images": [{{"type": "...", "description": "...", "bbox": [y_min, x_min, y_max, x_max]}}]}}"""
+        else:
+            system_prompt = """Przepisz dokladnie caly tekst widoczny na tym obrazie strony dokumentu jako pelny HTML. NIE uzywaj Markdown — zwracaj HTML.
  
 Uzyj natywnych tagow HTML:
 - Naglowki: <h1>, <h2>, <h3>
@@ -725,11 +739,14 @@ WAZNE ZASADY:
 - Zachowaj wartosci liczbowe, ceny, jednostki dokladnie.
 - W tabelach zachowaj powiazanie produktu z cenami.
 - SKRESLENIA: jesli przez tekst przechodzi linia (nawet cienka/szara) — oznacz <del>. Cenniki czesto maja skreslone 'ceny katalogowe' obok nizszych 'cen specjalnych'. Sprawdz KAZDY wiersz tabeli.
+- TABELE: Jesli strona zawiera JAKIEKOLWIEK dane tabelaryczne, MUSISZ uzyc <table><thead><tr><th>...</th></tr></thead><tbody><tr><td>...</td></tr></tbody></table>. NIGDY nie linearyzuj kolumn do akapitow ani <pre>.
  
 Odpowiedz WYLACZNIE JSON: {"text": "<h2>Tytul</h2><p>tekst z <del>skresleniem</del></p>"}"""
 
-    if not user_text:
-        user_text = "Przeanalizuj te strone dokumentu. Odtwórz pelna zawartosc strony w HTML z zachowaniem wszystkich stylowan wizualnych (skreslenia, kolory, podkreslenia, pogrubienia)."
+        user_text = (
+            "Przeanalizuj te strone dokumentu. Odtwórz pelna zawartosc strony w HTML "
+            "z zachowaniem wszystkich stylowan wizualnych (skreslenia, kolory, podkreslenia, pogrubienia)."
+        )
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -748,6 +765,7 @@ Odpowiedz WYLACZNIE JSON: {"text": "<h2>Tytul</h2><p>tekst z <del>skresleniem</d
         temperature=0,
         force_qwen=anonymize,
         qwen_api_key=qwen_api_key,
+        lovable_api_key=api_key,
     )
 
     content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
@@ -2526,4 +2544,100 @@ async def list_epub_jobs(x_api_key: str = Header(...)):
         "jobs": epub_jobs,
         "total": len(epub_jobs),
         "active": sum(1 for j in epub_jobs.values() if j["status"] == "processing"),
+    }
+
+
+# ══════════════════════════════════════════════════════════════
+# /crop-image — Crop a region from a page image using bbox (0-1000 scale)
+# ══════════════════════════════════════════════════════════════
+
+class CropImageRequest(BaseModel):
+    """Request body for cropping an image region."""
+    image_base64: str  # Base64-encoded page image (JPEG/PNG)
+    bbox: list  # [y_min, x_min, y_max, x_max] in 0-1000 scale
+    tenant_slug: str
+    kb_id: str
+    doc_id: str
+    filename: Optional[str] = None  # output filename, auto-generated if omitted
+    padding: float = 0.12  # padding ratio (12% default)
+    quality: int = 90  # JPEG quality
+
+
+@app.post("/crop-image")
+async def crop_image(
+    req: CropImageRequest,
+    x_api_key: str = Header(...),
+):
+    """
+    Crop a region from a base64 page image using bbox coordinates (0-1000 scale).
+    Adds configurable padding (default 12%) around the detected region.
+    Saves the cropped image as JPEG and returns the file URL path.
+    """
+    from PIL import Image
+
+    verify_api_key(x_api_key)
+
+    if not req.bbox or len(req.bbox) != 4:
+        raise HTTPException(status_code=400, detail="bbox must be [y_min, x_min, y_max, x_max] (4 values)")
+
+    try:
+        img_bytes = base64.b64decode(req.image_base64)
+        img = Image.open(io.BytesIO(img_bytes))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid image_base64: {e}")
+
+    img_width, img_height = img.size
+    y_min, x_min, y_max, x_max = req.bbox
+
+    # Apply padding (percentage of bbox dimensions)
+    bbox_w = x_max - x_min
+    bbox_h = y_max - y_min
+    pad_x = int(bbox_w * req.padding)
+    pad_y = int(bbox_h * req.padding)
+
+    x_min = max(0, x_min - pad_x)
+    y_min = max(0, y_min - pad_y)
+    x_max = min(1000, x_max + pad_x)
+    y_max = min(1000, y_max + pad_y)
+
+    # Convert 0-1000 scale to pixel coordinates
+    left = int(x_min / 1000 * img_width)
+    upper = int(y_min / 1000 * img_height)
+    right = int(x_max / 1000 * img_width)
+    lower = int(y_max / 1000 * img_height)
+
+    # Validate crop region
+    if (right - left) < 20 or (lower - upper) < 20:
+        raise HTTPException(status_code=400, detail="Crop region too small (< 20px)")
+
+    cropped = img.crop((left, upper, right, lower))
+
+    # Generate filename
+    crop_filename = req.filename or f"crop_{uuid.uuid4().hex[:8]}.jpg"
+    if not crop_filename.lower().endswith((".jpg", ".jpeg")):
+        crop_filename += ".jpg"
+
+    # Save to tenant storage
+    doc_path = get_doc_path(req.tenant_slug, req.kb_id, req.doc_id)
+    images_dir = doc_path / "_images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    crop_path = images_dir / crop_filename
+    cropped.save(str(crop_path), format="JPEG", quality=req.quality)
+
+    file_url = f"{req.tenant_slug}/{req.kb_id}/{req.doc_id}/_images/{crop_filename}"
+    size_bytes = crop_path.stat().st_size
+
+    logger.info(
+        f"[crop-image] Cropped {crop_filename} "
+        f"bbox=[{req.bbox}] padding={req.padding} "
+        f"size={size_bytes}B → {file_url}"
+    )
+
+    return {
+        "path": file_url,
+        "filename": crop_filename,
+        "size_bytes": size_bytes,
+        "crop_bbox": [y_min, x_min, y_max, x_max],
+        "original_size": [img_width, img_height],
+        "crop_size": [cropped.width, cropped.height],
     }
