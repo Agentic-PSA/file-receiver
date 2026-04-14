@@ -100,9 +100,64 @@ ocr_jobs: Dict[str, Dict[str, Any]] = {}
 # Active EPUB extraction jobs tracking (in-memory)
 epub_jobs: Dict[str, Dict[str, Any]] = {}
 
+# ── Central Prompt Fetching (from ocr-prompts Edge Function) ──
+
+_prompt_cache: Dict[str, Dict[str, str]] = {}
+_prompt_cache_ts: float = 0.0
+PROMPT_CACHE_TTL = 300  # 5 minutes
+
+async def fetch_central_prompt(prompt_key: str) -> Optional[Dict[str, str]]:
+    """
+    Fetch a prompt from the central ocr-prompts Edge Function.
+    Returns dict with 'system_prompt' and 'user_prompt_template', or None on failure.
+    Caches results for PROMPT_CACHE_TTL seconds.
+    """
+    import time
+    global _prompt_cache, _prompt_cache_ts
+
+    now = time.time()
+    if now - _prompt_cache_ts > PROMPT_CACHE_TTL:
+        _prompt_cache = {}
+        _prompt_cache_ts = now
+
+    if prompt_key in _prompt_cache:
+        return _prompt_cache[prompt_key]
+
+    supabase_url = os.getenv("SUPABASE_URL", "")
+    supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+    if not supabase_url or not supabase_key:
+        return None
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{supabase_url}/functions/v1/ocr-prompts?key={prompt_key}",
+                headers={
+                    "Authorization": f"Bearer {supabase_key}",
+                    "apikey": supabase_key,
+                },
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                prompts = data.get("prompts", [])
+                if prompts:
+                    entry = prompts[0]
+                    result = {
+                        "system_prompt": entry.get("system_prompt", ""),
+                        "user_prompt_template": entry.get("user_prompt_template", ""),
+                    }
+                    _prompt_cache[prompt_key] = result
+                    logger.info(f"[prompts] Fetched central prompt: {prompt_key}")
+                    return result
+    except Exception as e:
+        logger.warning(f"[prompts] Failed to fetch {prompt_key}: {e}")
+
+    return None
+
+
 app = FastAPI(
     title="BlueBox File Receiver",
-    version="4.9.0",
+    version="4.10.0",
     description="Tenant-isolated file storage + PDF-to-images + Background OCR Worker + Background EPUB extraction + Anonymization",
 )
 
@@ -589,8 +644,23 @@ async def ocr_call_gemini(
     extract_images: bool = False,
     image_desc_tokens: int = 200,
 ) -> Dict[str, Any]:
-    """Call Vision API for a single page image OCR with Gemini→OpenAI fallback."""
-    if extract_images:
+    """Call Vision API for a single page image OCR with Gemini→OpenAI fallback.
+    Tries to fetch prompts from the central ocr-prompts Edge Function first;
+    falls back to hardcoded prompts on failure."""
+
+    # ── Try central prompts first ─────────────────────────────
+    prompt_key = "ocr_extract_images" if extract_images else "ocr_text_only"
+    central = await fetch_central_prompt(prompt_key)
+
+    user_text = None  # default user message text
+
+    if central and central.get("system_prompt"):
+        system_prompt = central["system_prompt"]
+        # Allow the central prompt to override the user message as well
+        if central.get("user_prompt_template"):
+            user_text = central["user_prompt_template"]
+    elif extract_images:
+        # ── Fallback: hardcoded extract-images prompt ─────────
         system_prompt = """Jestes ekspertem od ekstrakcji tresci z dokumentow. Wykonaj DWA zadania w JEDNYM przebiegu:
 1. PELNY HTML STRONY: Odtwórz calą zawartosc strony jako kompletny HTML. Uzyj natywnych tagow HTML do wiernego oddania struktury i formatowania:
    - Naglowki: <h1>, <h2>, <h3> itd.
@@ -634,6 +704,7 @@ KRYTYCZNE ZASADY BBOX:
 Odpowiedz WYLACZNIE JSON:
 {"text": "<h2>Tytul</h2><table>...</table><p>tekst z <del>skresleniem</del></p>", "images": [{"type": "...", "description": "...", "bbox": [y_min, x_min, y_max, x_max]}]}"""
     else:
+        # ── Fallback: hardcoded text-only prompt ──────────────
         system_prompt = """Przepisz dokladnie caly tekst widoczny na tym obrazie strony dokumentu jako pelny HTML. NIE uzywaj Markdown — zwracaj HTML.
  
 Uzyj natywnych tagow HTML:
@@ -657,12 +728,15 @@ WAZNE ZASADY:
  
 Odpowiedz WYLACZNIE JSON: {"text": "<h2>Tytul</h2><p>tekst z <del>skresleniem</del></p>"}"""
 
+    if not user_text:
+        user_text = "Przeanalizuj te strone dokumentu. Odtwórz pelna zawartosc strony w HTML z zachowaniem wszystkich stylowan wizualnych (skreslenia, kolory, podkreslenia, pogrubienia)."
+
     messages = [
         {"role": "system", "content": system_prompt},
         {
             "role": "user",
             "content": [
-                {"type": "text", "text": "Przeanalizuj te strone dokumentu. Odtwórz pelna zawartosc strony w HTML z zachowaniem wszystkich stylowan wizualnych (skreslenia, kolory, podkreslenia, pogrubienia)."},
+                {"type": "text", "text": user_text},
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}},
             ],
         },
@@ -1992,6 +2066,57 @@ async def pdf_to_images(req: PdfToImagesRequest, x_api_key: str = Header(...)):
         "total_pages": len(result_pages),
         "dpi": req.dpi,
     }
+
+
+
+@app.post("/pdf-to-images-stream")
+async def pdf_to_images_stream(req: PdfToImagesRequest, x_api_key: str = Header(...)):
+    """
+    Convert PDF pages to JPEG images and stream them as NDJSON (one JSON line per page).
+    This avoids buffering all pages in memory at once.
+    """
+    verify_api_key(x_api_key)
+
+    try:
+        from pdf2image import convert_from_bytes
+    except ImportError:
+        raise HTTPException(status_code=500, detail="pdf2image not installed")
+
+    try:
+        pdf_bytes = base64.b64decode(req.pdf_base64)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64 PDF data")
+
+    if len(pdf_bytes) > MAX_FILE_SIZE_MB * 1024 * 1024:
+        raise HTTPException(status_code=413, detail=f"PDF too large. Max: {MAX_FILE_SIZE_MB}MB")
+
+    from starlette.responses import StreamingResponse
+
+    async def generate():
+        pages = parse_pages(req.pages)
+        kwargs = {"dpi": req.dpi, "fmt": "jpeg"}
+        if pages:
+            kwargs["first_page"] = pages[0]
+            kwargs["last_page"] = pages[1]
+
+        try:
+            images = convert_from_bytes(pdf_bytes, **kwargs)
+        except Exception as e:
+            yield json.dumps({"error": str(e)}) + "\n"
+            return
+
+        start_page = pages[0] if pages else 1
+        for i, img in enumerate(images):
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=req.quality)
+            img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+            buf.close()
+            yield json.dumps({
+                "page_index": start_page + i - 1,
+                "image_base64": img_b64,
+            }) + "\n"
+
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
 
 # ── EPUB extraction (Background Worker) ───────────────────────
 
